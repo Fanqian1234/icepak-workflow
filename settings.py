@@ -22,8 +22,8 @@ WORK = RUNS / "work"
 STATE = RUNS / "state"
 QUEUE_FILE = STATE / "REQUESTED_CASES.txt"
 PAUSE_FILE = STATE / "ADMISSION_PAUSED"
-CODE_REVISION = "local-reliability-20261105-r3"
-MESH_REVISION = "explicit-package-core-mesh-20261105-r3"
+CODE_REVISION = "native-source-contract-20261105-r4"
+MESH_REVISION = "validated-local-source-mesh-20261105-r4"
 SAMPLES = RUNS / "samples"
 PUBLISHED = RUNS / "published"
 ASSETS = EXPERIMENT / "assets"
@@ -225,3 +225,4 @@ def production_signature():
 def assert_release_unchanged(signature):
     if production_signature()!=signature:
         raise RuntimeError("CODE_CHANGED_DURING_CASE: stop admission and deploy only after drain")
+

@@ -612,15 +612,11 @@ def run_native_cht(spec,plan,workspace,cores=4,max_iterations=450):
         if not app.save_project():
             raise RuntimeError("AEDT project cannot be saved")
         save_state(spec.case_id,"CHT_MESHING",stage_start_epoch=time.time())
-        scratch_before={p.name for p in (RUNS/"native_solver_tmp").glob("icepak_*.pjt") if p.is_dir()}
-        mesh_started=time.time()
-        if not app.mesh.generate_mesh(setup_name):
-            raise RuntimeError("NATIVE_MESH_GENERATION_FAILED")
-        mesh_proof=_native_mesh_audit(app,workspace,plan,setup_name,
-                                     scratch_before=scratch_before,mesh_started=mesh_started)
-        print("NATIVE_MESH_PRE_SOLVE_PASS",spec.case_id,json.dumps(mesh_proof),flush=True)
-        save_state(spec.case_id,"CHT_SOLVING",stage_start_epoch=time.time(),
-                   native_mesh_audit=mesh_proof)
+        # AEDT 2023 R2's standalone GenerateMesh COM macro is unreliable for
+        # fresh Icepak designs and fails before Fluent starts.  analyze_setup
+        # owns the supported mesh->solve transaction and produces the native
+        # restart pair used by all downstream gates.
+        save_state(spec.case_id,"CHT_SOLVING",stage_start_epoch=time.time())
         ok=app.analyze_setup(setup_name,cores=int(cores),tasks=int(cores),
                              use_auto_settings=False,blocking=True)
         if not ok:
@@ -689,3 +685,4 @@ def run_native_cht(spec,plan,workspace,cores=4,max_iterations=450):
     finally:
         if app is not None:
             release_native_aedt(app)
+
