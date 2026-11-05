@@ -25,8 +25,14 @@ def counts_for_bbox(name,box):
         raise ValueError("Invalid real CAD extent for mesh: "+name)
     source = name.lower().startswith("active_") and "source" in name.lower()
     feol = name.startswith("Passive_FEOL_")
-    if source or feol:
-        # Preserve the validated 10-um Source/FEOL four-cell Z contract.
+    if source:
+        # Preserve four cells across 10-um Z. Smaller 1.2-1.8 mm Sources
+        # must have at least 12 lateral cells to keep a native power-bearing
+        # volume zone; the earlier 9x9 mesh lost a 1.8-mm Source body.
+        # Do not refine large Source geometries or passive FEOL globally.
+        xy=[min(64,max(12,math.ceil(extents[i]/.20-1e-9))) for i in (0,1)]
+        z=max(4,math.ceil(extents[2]/.0025-1e-9))
+    elif feol:
         xy=[min(64,max(4,math.ceil(extents[i]/.20-1e-9))) for i in (0,1)]
         z=max(4,math.ceil(extents[2]/.0025-1e-9))
     elif name.startswith("Heatsink_Fin_"):
@@ -59,6 +65,83 @@ def counts_for_bbox(name,box):
     return [*xy,z]
 
 
+def _source_core_mesh_contract(plan, source_names, feol_names):
+    """A single geometry-driven conformal core grid, not per-Source retries.
+
+    The native global grid can miss 10-um Source solids despite having
+    per-object Box Local Mesh Operations. A shared subregion forces adjacent
+    Source, FEOL and package solids onto one resolved HDM stack, as in the
+    historically validated source-core meshing method.
+    """
+    bodies=sorted(set(source_names)|set(feol_names)|
+                  {"Substrate","Bump","HB","Die","TIM1"})
+    if not all(name in plan.by_name for name in bodies):
+        raise RuntimeError("Shared source core lacks frozen package geometry")
+    sides=[]
+    for name in source_names:
+        b=plan.by_name[name].bbox_mm
+        sides.extend([b[3]-b[0],b[4]-b[1]])
+    if not sides or min(sides)<=0:
+        raise RuntimeError("Shared source core has invalid Source footprints")
+    pitch=min(1.0,min(sides)/3.0)
+    z_pitch=0.005  # Accepted thin-Source stack: 2 shared cells per 10 um.
+    lo=[min(plan.by_name[name].bbox_mm[i] for name in bodies) for i in range(3)]
+    hi=[max(plan.by_name[name].bbox_mm[i+3] for name in bodies) for i in range(3)]
+    counts=[math.ceil((hi[i]-lo[i])/([pitch,pitch,z_pitch][i])-1e-9)
+            for i in range(3)]
+    if math.prod(counts)>400_000:
+        # Never silently generate a huge grid. Future very small Source
+        # shapes need a bounded, general subdivision rather than weakening
+        # the real native volume-cell acceptance gate.
+        raise RuntimeError("Shared source core exceeds 400k estimated cells")
+    return {"members":bodies,"pitch_xy_mm":pitch,"pitch_z_mm":z_pitch,
+            "bbox_mm":lo+hi,"estimated_cells":math.prod(counts),
+            "target_grid_counts":counts}
+
+
+def _apply_shared_source_core(app,plan,source_names,feol_names):
+    """Create one native non-model source-stack subregion in AEDT 2023 R2."""
+    from ansys.aedt.core.modules.mesh_icepak import MeshRegion
+    contract=_source_core_mesh_contract(plan,source_names,feol_names)
+    name="PhysicalSourceConformalCore"
+    before=set(app.modeler.object_names)
+    result=MeshRegion(app,contract["members"],name=name)
+    after=set(app.modeler.object_names)
+    added=sorted(after-before)
+    if (not result or len(added)!=1
+            or not set(added).issubset(set(app.modeler.non_model_objects))):
+        raise RuntimeError("Native shared Source core was not created as one non-model mesh helper")
+    pitch=f'{contract["pitch_xy_mm"]:.8g}mm'
+    thin=f'{contract["pitch_z_mm"]:.8g}mm'
+    args=[f"NAME:{name}",
+          "Enable:=",True,
+          "MeshMethod:=","MesherHD",
+          "UserSpecifiedSettings:=",True,
+          "ComputeGap:=",False,
+          "MaxElementSizeX:=",pitch,
+          "MaxElementSizeY:=",pitch,
+          "MaxElementSizeZ:=",thin,
+          "MinElementsInGap:=","2",
+          "MinElementsOnEdge:=","2",
+          "MaxSizeRatio:=","2",
+          "NoOGrids:=",False,
+          "EnableMLM:=",True,
+          "EnforeMLMType:=","3D",
+          "MaxLevels:=","0",
+          "BufferLayers:=","0",
+          "UniformMeshParametersType:=","Average",
+          "StairStepMeshing:=",False,
+          "MinGapX:=",pitch,
+          "MinGapY:=",pitch,
+          "MinGapZ:=",thin,
+          "Objects:=",added]
+    app.omeshmodule.EditMeshRegion(name,args)
+    contract["status"]="PASS"
+    contract["region_name"]=name
+    contract["subregion_helpers"]=added
+    return contract
+
+
 def legacy_t0_source_tile_counts(name,box):
     """Verified conformal T0 source/FEOL tile grid; never changes the CAD.
 
@@ -80,7 +163,7 @@ def legacy_t0_source_tile_counts(name,box):
     return counts
 
 
-def apply_physical_source_mesh(app,object_names,package_conduction=False):
+def apply_physical_source_mesh(app,object_names,package_conduction=False,*,plan):
     """Apply legacy bulk global mesh plus selective native contact/fin boxes.
 
     Neither stage assumes that separate native meshes are conformal. Native
@@ -99,6 +182,8 @@ def apply_physical_source_mesh(app,object_names,package_conduction=False):
             int(region.settings["MeshRegionResolution"])!=bulk_resolution):
         raise RuntimeError("Native global mesh resolution was not applied")
     available = set(app.modeler.object_names)
+    if any(name not in plan.by_name for name in object_names):
+        raise RuntimeError("Native mesh has no authoritative CAD-plan solid")
     if "Region" in available:
         raise RuntimeError("Default AEDT Region overlaps the physical CHT domain")
     required = {"Bump","HB","Die"}
@@ -123,19 +208,19 @@ def apply_physical_source_mesh(app,object_names,package_conduction=False):
         raise ValueError("CHT must contain the genuine heatsink air channels")
     planned = {}
     fins=sorted((n for n in solids if n.startswith("Heatsink_Fin_")),
-                key=lambda n: float(app.modeler[n].bounding_box[0]))
+                key=lambda n: float(plan.by_name[n].bbox_mm[0]))
     min_gap=None
     if not package_conduction:
         if len(fins)<2:
             raise ValueError("No genuine inter-fin air channels")
-        gaps=[float(app.modeler[b].bounding_box[0])-
-              float(app.modeler[a].bounding_box[3])
+        gaps=[float(plan.by_name[b].bbox_mm[0])-
+              float(plan.by_name[a].bbox_mm[3])
               for a,b in zip(fins,fins[1:])]
         min_gap=min(gaps)
         if min_gap<=0:
             raise ValueError("Physical heatsink fins overlap or close the air gap")
     for index,name in enumerate(solids,1):
-        box = [float(v) for v in app.modeler[name].bounding_box]
+        box = [float(v) for v in plan.by_name[name].bbox_mm]
         counts = (legacy_t0_source_tile_counts(name,box)
                   if package_conduction and (name in sources or name in feol)
                   else counts_for_bbox(name,box))
@@ -185,10 +270,13 @@ def apply_physical_source_mesh(app,object_names,package_conduction=False):
         planned[name]={"operation":opname,"counts":counts,
                        "max_level":max_level,"separate":separate,
                        "physical_bbox_mm":box}
+    core=None if package_conduction else _apply_shared_source_core(
+        app,plan,sources,feol)
     return {
         "status":"PASS",
         "method":"PHYSICAL_ASPECT_AND_SELECTIVE_NCI_MESH",
-        "names":sorted({row["operation"] for row in planned.values()}),
+        "names":sorted({row["operation"] for row in planned.values()}|
+                       ({core["region_name"]} if core else set())),
         "assignment":solids,
         "physical_local_mesh":planned,
         "global_mesh_objects":sorted(all_solids-set(solids)),
@@ -197,8 +285,9 @@ def apply_physical_source_mesh(app,object_names,package_conduction=False):
         "source_geometry_unchanged":True,
         "requires_pre_solve_reopen":True,
         "manual_settings":False,
-        "shared_core_mesh":False,
-        "mesh_subregion_objects":[],
+        "shared_core_mesh":bool(core),
+        "mesh_subregion_objects":core["subregion_helpers"] if core else [],
+        "source_core_region":core,
         "source_interface_target":"IMPRINTED_MATERIAL_CONTACT",
         "reason":f"Global-{bulk_resolution} bulk mesh; local Source/FEOL, TIM2 and fin occupancy",
     }

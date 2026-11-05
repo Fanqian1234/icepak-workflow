@@ -160,13 +160,13 @@ def _produce_native(spec,plan,workspace,target,cores):
         # The top is an exposed solid face, not an air-solid interface. Use
         # the same native wall API and 20 C reference as the bottom HTC=50.
         wall=assign_package_top_htc(app,plan,T0_LEVELS[0])
-        apply_physical_source_mesh(app,solids,package_conduction=True)
+        apply_physical_source_mesh(app,solids,package_conduction=True,plan=plan)
         # One project and one mesh for all four h0 values. Changing the wall
         # boundary invalidates each previous solve, so export immediately.
         for name in list(app.setup_names):
             app.delete_setup(name)
         setup=app.create_setup(
-            "BoundT0",
+            "BoundT0",setup_type="IcepakSteadyState",
             props={"Include Flow":False,"Include Temperature":True,
                    "Include Gravity":False,"Include Solar":False,
                    "Radiation Model":"Off",
@@ -234,8 +234,14 @@ def provide_four_t0(spec,plan,workspace,sampled,cores=4):
             receipt=json.loads(ready.read_text(encoding="utf-8"))
             if receipt.get("status")!="PASS":
                 return False
-            _validate_four_h0_response(
-                spec,plan,receipt["statistics"])
+            statistics={}
+            for h in T0_LEVELS:
+                array=np.loadtxt(cache/f"T0_h0_{h}_40x40_C.tab",ndmin=2)
+                if array.shape!=(1600,4) or not np.isfinite(array).all():return False
+                values=array[:,3]
+                statistics[str(h)]={"mean_C":float(values.mean()),
+                                    "min_C":float(values.min()),"max_C":float(values.max())}
+            _validate_four_h0_response(spec,plan,statistics)
         except (OSError,ValueError,TypeError,KeyError,RuntimeError):
             return False
         return True
@@ -249,10 +255,17 @@ def provide_four_t0(spec,plan,workspace,sampled,cores=4):
                 # A killed T0 worker must not leave a permanent shared-cache
                 # deadlock. Probe only the one owner PID, not a giant directory.
                 try:
-                    owner=int(lock.read_text(encoding="ascii").strip())
-                except (OSError,ValueError):
-                    owner=0
-                if owner>0 and not psutil.pid_exists(owner):
+                    raw=lock.read_text(encoding="ascii").strip()
+                    metadata=json.loads(raw)
+                    owner=metadata.get("pid",0) if isinstance(metadata,dict) else int(metadata)
+                    birth=metadata.get("birth") if isinstance(metadata,dict) else None
+                except (OSError,ValueError,TypeError):
+                    owner=0;birth=None
+                alive=psutil.pid_exists(owner) if owner>0 else False
+                if alive and birth is not None:
+                    try:alive=abs(psutil.Process(owner).create_time()-float(birth))<1
+                    except psutil.NoSuchProcess:alive=False
+                if owner>0 and not alive:
                     lock.unlink(missing_ok=True)
                     continue
                 if owner==0 and lock.exists() and (
@@ -264,17 +277,19 @@ def provide_four_t0(spec,plan,workspace,sampled,cores=4):
                 time.sleep(3)
                 continue
             else:
-                os.write(fd,str(os.getpid()).encode("ascii"))
+                os.write(fd,json.dumps({"pid":os.getpid(),"birth":psutil.Process().create_time()}).encode("ascii"))
                 os.close(fd)
                 try:
                     if not complete():
                         scratch=Path(workspace)/"t0"
                         scratch.mkdir(parents=True,exist_ok=True)
                         meta=_produce_native(spec,plan,scratch,cache,cores)
-                        ready.write_text(json.dumps({
+                        pending=cache/".READY.pending"
+                        pending.write_text(json.dumps({
                             "status":"PASS","source":"PACKAGE_ONLY_NATIVE_HTC",
                             "h0_values_W_m2K":T0_LEVELS,
                             "statistics":meta},indent=2)+"\n",encoding="utf-8")
+                        os.replace(pending,ready)
                 finally:
                     lock.unlink(missing_ok=True)
                 break

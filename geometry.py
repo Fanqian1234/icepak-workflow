@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+import time
+import traceback
 
 
 class SourceGeometryError(ValueError):
@@ -181,7 +183,7 @@ def plan_case_geometry(spec):
                                 tuple(p["origin_mm"]),
                                 tuple(p["dimensions_mm"])))
     for p in source_plan["sources"]:
-        solids.append(Solid(p["name"], "Source", "FEOL",
+        solids.append(Solid(p["name"], "Source", "FEOL_Source",
                             tuple(p["origin_mm"]), tuple(p["dimensions_mm"])))
     base_z = _bbox(stack["TIM2"],"TIM2")[5]
     # Frozen production geometry: X=base_length is the fin-array direction;
@@ -220,6 +222,27 @@ def plan_case_geometry(spec):
                    spec.air_velocity_m_per_s)
 
 
+def _assign_native_source_with_tree_retry(app,source,index):
+    """Retry a transient PyAEDT tree read only before native Source creation."""
+    name=f"P_source_{index:03d}"
+    for attempt in range(5):
+        try:
+            bound=app.assign_source(
+                source["name"],"Total Power",f"{source['power_W']:.12g}W",
+                boundary_name=name,radiate=False)
+            if not bound:
+                raise RuntimeError("Native Source assignment did not return a boundary")
+            return bound
+        except TypeError as exc:
+            frames=traceback.extract_tb(exc.__traceback__)
+            if ("NoneType" not in str(exc) or
+                    not any(frame.name=="_child_object" for frame in frames)):
+                raise
+            if attempt==4:
+                raise RuntimeError("Native Source tree unavailable after retries: "+name) from exc
+            time.sleep(0.35*(attempt+1))
+
+
 def create_native_cad(app, plan: CADPlan, package_only=False):
     """Build from an actually blank Icepak design with frozen physical solids.
 
@@ -251,11 +274,11 @@ def create_native_cad(app, plan: CADPlan, package_only=False):
             raise RuntimeError("Unexpected AEDT solid identity: "+actual+
                                " expected "+part.name)
         created.append(actual)
-    # Create explicit matching subfaces at all Source and TIM2 contacts.
-    for p in plan.source_plan["sources"]:
-        neighbors=("Bump","HB") if p["layer"]=="bot" else ("HB","Die")
-        if not app.modeler.imprint(list(neighbors),[p["name"]],keep_originals=True):
-            raise RuntimeError("Source CAD imprint failed: "+p["name"])
+    # Keep the exactly touching Source/Bump/HB/Die stack as analytic boxes.
+    # Imprinting every tiny Source into its neighbors turns those boxes into
+    # faceted CAD; HDM was then collapsing all 10-um Source/FEOL cells even
+    # with a 2.5-um local pitch. No geometry, material or power is changed.
+    # Actual two-sided native contact and occupied-cell gates remain mandatory.
     # The IHS top is split into TIM2-contact and exposed regions even in T0.
     # Preserve the verified blank/tool imprint order to expose both regions.
     if not app.modeler.imprint(["IHS"],["TIM2"],keep_originals=True):
@@ -267,9 +290,5 @@ def create_native_cad(app, plan: CADPlan, package_only=False):
         if not app.modeler.imprint(["Heatsink_Base"],fins,keep_originals=True):
             raise RuntimeError("Fin/base native contact imprint failed")
     for idx,p in enumerate(plan.source_plan["sources"],1):
-        boundary=app.assign_source(
-            p["name"],"Total Power",f"{p['power_W']:.12g}W",
-            boundary_name=f"P_source_{idx:03d}",radiate=False)
-        if not boundary:
-            raise RuntimeError("Native Source power assignment failed: "+p["name"])
+        _assign_native_source_with_tree_retry(app,p,idx)
     return created

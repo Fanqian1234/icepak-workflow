@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import re
 import shutil
 import psutil
 from contextlib import contextmanager
@@ -22,7 +23,7 @@ from settings import AEDT_VERSION, AMBIENT_C, RUNS
 THERMAL_K = {
     "Substrate":1.9, "Bump":[10.0,10.0,30.0],
     "HB":[5.0,5.0,15.0], "Si":140.0,
-    "TIM1":10.0, "TIM2":5.0, "FEOL":20.0,
+    "TIM1":10.0, "TIM2":5.0, "FEOL":20.0, "FEOL_Source":20.0,
     "Cu":400.0,"aluminum":200.0,"Al-Extruded":205.0,
     "air":0.0261,
 }
@@ -33,7 +34,7 @@ THERMAL_DENSITY_CP = {
     "Substrate":(1.0,1_000_000.0), "Bump":(1.0,3_000_000.0),
     "HB":(1.0,3_000_000.0), "Si":(1.0,1_630_000.0),
     "TIM1":(1.0,3_000_000.0), "TIM2":(1.0,3_000_000.0),
-    "FEOL":(1.0,1_630_000.0), "Cu":(1.0,3_450_000.0),
+    "FEOL":(1.0,1_630_000.0), "FEOL_Source":(1.0,1_630_000.0), "Cu":(1.0,3_450_000.0),
     "aluminum":(1.0,2_400_000.0),
     "Al-Extruded":(2800.0,900.0), "air":(1.1614,1005.0),
 }
@@ -52,13 +53,30 @@ def _materials(app,plan):
             material=materials[name]
         if not material:
             raise RuntimeError("Cannot create native thermal material "+name)
-        material.thermal_conductivity=conductivity
         density,heat_capacity=THERMAL_DENSITY_CP[name]
-        material.mass_density=density
-        material.specific_heat=heat_capacity
-        if name=="air":
-            # Exact constant air viscosity of the accepted AEDT carrier.
-            material.viscosity=1.84e-5
+        previous_update=material._material_update
+        material._material_update=False
+        try:
+            material.thermal_conductivity=conductivity
+            material.mass_density=density
+            material.specific_heat=heat_capacity
+            if name=="air":
+                # Exact constant air viscosity of the accepted AEDT carrier.
+                material.viscosity=1.84e-5
+        finally:
+            material._material_update=previous_update
+        # A native RPC can briefly return None while a new AEDT desktop
+        # initializes its material manager; retry this single complete commit.
+        for attempt in range(3):
+            try:
+                if material.update():
+                    break
+            except (TypeError,AttributeError,RuntimeError):
+                if attempt==2:
+                    raise
+            time.sleep(1)
+        else:
+            raise RuntimeError("Native AEDT material update was not accepted: "+name)
 
 
 def set_native_ambient(app):
@@ -85,7 +103,9 @@ def assign_package_exterior_thermal(app,plan,include_heatsink=False):
     side=[]
     for name in layers:
         obj=app.modeler[name]
-        box=[float(v) for v in obj.bounding_box]
+        # The frozen CAD plan fixes the exact face planes; only native AEDT
+        # faces/areas, not unreliable bbox RPC snapshots, establish ownership.
+        box=[float(v) for v in plan.by_name[name].bbox_mm]
         for axis in (0,1):
             for offset in (0,3):
                 plane=[int(face.id) for face in obj.faces
@@ -98,7 +118,7 @@ def assign_package_exterior_thermal(app,plan,include_heatsink=False):
     # IHS/TIM2/base interfaces stay native conducting contacts.
     side=sorted(set(side))
     substrate=app.modeler["Substrate"]
-    bottom_z=float(substrate.bounding_box[2])
+    bottom_z=float(plan.by_name["Substrate"].bbox_mm[2])
     bottom_faces=[f for f in substrate.faces
                   if abs(float(f.center[2])-bottom_z)<1e-7]
     bottom=sorted(int(f.id) for f in bottom_faces)
@@ -273,7 +293,7 @@ def _fluid_domain(app,plan,solid_names):
 
 def _steady_setup(app,max_iterations):
     names=list(app.setup_names)
-    setup=app.get_setup("Setup1") if "Setup1" in names else app.create_setup("Setup1")
+    setup=app.get_setup("Setup1") if "Setup1" in names else app.create_setup("Setup1",setup_type="IcepakSteadyState")
     if not setup:
         raise RuntimeError("Cannot create native steady-state setup")
     # Restore the physically accepted Icepak steady-state CHT options.
@@ -322,9 +342,12 @@ def configure_aedt_runtime(case_workspace):
     os.environ["LOCALAPPDATA"]=str(profile/"AppData/Local")
     os.environ["TEMP"]=str(profile/"Temp")
     os.environ["TMP"]=str(profile/"Temp")
-    os.environ["PYAEDT_USE_PRE_GRPC_ARGS"]="True"
+    # Local Windows PyAEDT 1.1: use the same native COM transport that
+    # generated strictly accepted Cases. Its gRPC sessions intermittently
+    # returned None for material, geometry, mesh and design-tree calls.
+    os.environ.pop("PYAEDT_USE_PRE_GRPC_ARGS", None)
     from ansys.aedt.core.generic.settings import settings
-    settings.use_grpc_api=True
+    settings.use_grpc_api=False
 
 
 def configure_native_solver_directory(app, case_workspace):
@@ -346,6 +369,7 @@ def configure_native_solver_directory(app, case_workspace):
 def release_native_aedt(app):
     """Close AEDT and clean only stopped Fluent scratch owned by this session."""
     engine_pids=set()
+    desktop=None
     try:
         desktop=psutil.Process(int(app.odesktop.GetProcessID()))
         engine_pids={child.pid for child in desktop.children(recursive=True)
@@ -353,8 +377,43 @@ def release_native_aedt(app):
     except (OSError, ValueError, psutil.Error):
         pass
     try:
+        # Never close a desktop while an independently running native solve
+        # remains below it. The manager reports it rather than killing it.
+        if desktop is not None:
+            names=[child.name().lower() for child in desktop.children(recursive=True)]
+            if any(name in ("hdm.exe","fluent.exe") or name.startswith("fl_mpi") for name in names):
+                print("NATIVE_SESSION_STILL_COMPUTING_PRESERVED",desktop.pid,flush=True)
+                return
         app.release_desktop(close_projects=True,close_desktop=True)
     finally:
+        # The caller has finished the blocking native solve/field sampling.
+        # COM release can leave this isolated AEDT + ansyscl helper alive.
+        # Close ONLY the worker-owned session, with no active solver child.
+        if desktop is not None:
+            try:
+                if desktop.is_running():
+                    command=" ".join(desktop.cmdline()).lower().replace(chr(92),"/")
+                    owned="/icepak_workflow/runs/work/case_" in command
+                    children=desktop.children(recursive=True)
+                    safe=all(child.name().casefold()=="ansyscl.exe" for child in children)
+                    if (owned and safe and
+                            desktop.name().casefold()=="ansysedt.exe"):
+                        desktop.terminate()
+                        try:
+                            desktop.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            print("NATIVE_AEDT_EXIT_PENDING",desktop.pid,flush=True)
+                        for child in children:
+                            try:
+                                if child.is_running() and child.name().casefold()=="ansyscl.exe":
+                                    child.terminate()
+                            except psutil.Error:
+                                pass
+                        print("OWNED_TERMINAL_AEDT_RELEASED",desktop.pid,flush=True)
+                    elif owned and not safe:
+                        print("NATIVE_AEDT_HAS_LIVE_SOLVER_CHILD",desktop.pid,flush=True)
+            except psutil.Error as error:
+                print("NATIVE_AEDT_CLEANUP_DEFERRED",type(error).__name__,flush=True)
         shared=(RUNS/"native_solver_tmp").resolve()
         for pid in engine_pids:
             if psutil.pid_exists(pid):
@@ -413,6 +472,89 @@ def _native_convergence_receipt(app,max_iterations):
     return result
 
 
+def _hdm_source_occupancy(files,plan):
+    """Read native HDM volume-cell statistics, never substitute planned CAD."""
+    from native_io import NativeMeshError
+    required={part.name for part in plan.solids if part.role=="Source"}
+    counts={};snapshots={}
+    for file in files:
+        path=Path(file)
+        if not path.is_file() or path.stat().st_size>2_000_000:continue
+        text=path.read_text(encoding="utf-8",errors="replace")
+        if not re.search(r"#\s*Name\s+Cells\s+Faces",text):continue
+        table={}
+        for line in text.splitlines():
+            m=re.fullmatch(r"\s*(\S+)\s+(\d+)\s+(\d+)\s*",line)
+            if m:
+                name,n=m[1],int(m[2]);table[name]=n
+                counts[name]=max(counts.get(name,0),n)
+        snapshots[str(path)]=table
+    if not snapshots:
+        raise NativeMeshError("NATIVE_MESH_STATS_UNSUPPORTED",{"detail":"No native per-object HDM volume-cell table","files":[str(x) for x in files]})
+    missing=sorted(name for name in required if counts.get(name,0)<1)
+    report={"evidence":"HDM_GRID_STATS_NATIVE_VOLUME_CELLS", "expected_sources":sorted(required),
+            "source_cell_counts":{x:counts.get(x,0) for x in sorted(required)},
+            "native_tables":snapshots,"missing":missing}
+    if missing:raise NativeMeshError("NATIVE_SOLID_CELL_MISSING",report)
+    return dict(report,status="PASS_NATIVE_HDM_SOURCE_VOLUME_CELLS",expected_source_count=len(required))
+
+
+def _native_mesh_audit(app,workspace,plan,setup_name,*,scratch_before=(),mesh_started=None):
+    """Inspect actual mesh-only output before flow iterations on AEDT 2023R2."""
+    from native_io import early_native_source_occupancy,NativeMeshError
+    workspace=Path(workspace);roots=[workspace/"case.aedtresults"]
+    scratch=(RUNS/"native_solver_tmp").resolve();engines=[]
+    try:
+        desktop=psutil.Process(int(app.odesktop.GetProcessID()))
+        engines=[child.pid for child in desktop.children(recursive=True)
+                 if child.name().lower()=="icepakcomengine.exe"]
+    except psutil.Error:pass
+    for pid in engines:roots.extend(scratch.glob(f"icepak_*_{pid}.pjt"))
+    # GenerateMesh may close its engine before returning. Capture only the
+    # new scratch directory created during this exclusive local mesh stage;
+    # do not reuse an unrelated old Case's latest file.
+    if mesh_started is not None:
+        newdirs=[p for p in scratch.glob("icepak_*.pjt")
+                 if p.is_dir() and p.name not in set(scratch_before)
+                 and p.stat().st_ctime>=mesh_started-2]
+        if len(newdirs)>1:
+            raise NativeMeshError("NATIVE_MESH_SCRATCH_AMBIGUOUS",{"detail":[str(p) for p in newdirs]})
+        roots.extend(newdirs)
+    roots=list(dict.fromkeys(p.resolve() for p in roots))
+    candidates=[];statistics=[]
+    # ExportMeshStats is a native API; preserve its report even when its text
+    # schema is not the HDM table consumed below.
+    exported=workspace/"native_mesh_stats.ms"
+    try:app.export_mesh_stats(setup_name,output_file=str(exported))
+    except Exception as error:print("MESH_STATS_EXPORT_DIAGNOSTIC",type(error).__name__,str(error),flush=True)
+    if exported.is_file():statistics.append(exported)
+    for root in roots:
+        if not root.is_dir():continue
+        for name in ("current.nc_cas",setup_name+".nc_cas",setup_name+".cas"):
+            candidates.extend(root.rglob(name))
+        statistics.extend(root.glob("grid_stats_*"))
+    proof=None;failures=[]
+    for path in sorted(set(candidates),key=lambda p:(not p.name.endswith(".nc_cas"),str(p))):
+        if not path.is_file() or not path.stat().st_size:continue
+        try:proof=early_native_source_occupancy(path,plan);break
+        except NativeMeshError as exc:
+            failures.append(exc)
+            if exc.code=="NATIVE_SOLID_CELL_MISSING":break
+    if proof is None and not any(x.code=="NATIVE_SOLID_CELL_MISSING" for x in failures):
+        try:proof=_hdm_source_occupancy(statistics,plan)
+        except NativeMeshError as exc:failures.append(exc)
+    if proof is None:
+        failure=next((x for x in failures if x.code=="NATIVE_SOLID_CELL_MISSING"),None)
+        if failure is None:failure=failures[-1] if failures else NativeMeshError("NATIVE_MESH_PREFLIGHT_UNAVAILABLE",{"detail":"No occupied-cell mesh evidence"})
+        report={"code":failure.code,"diagnostic":failure.diagnostic,"stage":"AFTER_MESH_BEFORE_FLOW", "case_id":workspace.name,
+                "scoped_roots":[str(x) for x in roots]}
+        (workspace/"NATIVE_MESH_AUDIT.json").write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
+        raise failure
+    report={"code":"PASS","stage":"AFTER_MESH_BEFORE_FLOW","case_id":workspace.name,"diagnostic":proof}
+    (workspace/"NATIVE_MESH_AUDIT.json").write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
+    return proof
+
+
 @contextmanager
 def run_native_cht(spec,plan,workspace,cores=4,max_iterations=450):
     """Yield an open native CHT solve for sampling, then release AEDT.
@@ -434,6 +576,10 @@ def run_native_cht(spec,plan,workspace,cores=4,max_iterations=450):
         if not app:
             raise RuntimeError("Native AEDT Icepak startup failed")
         configure_native_solver_directory(app,workspace)
+        from publish import save_state
+        desktop=psutil.Process(int(app.odesktop.GetProcessID()))
+        save_state(spec.case_id,"CHT_MODELING",stage_start_epoch=time.time(),
+                   native_processes=[{"pid":desktop.pid,"birth":desktop.create_time()}])
         app.modeler.model_units="mm"
         app.problem_type="TemperatureAndFlow"
         if app.problem_type!="TemperatureAndFlow":
@@ -448,10 +594,20 @@ def run_native_cht(spec,plan,workspace,cores=4,max_iterations=450):
         air=_fluid_domain(app,plan,solids)
         package_walls=assign_package_exterior_thermal(
             app,plan,include_heatsink=True)
-        mesh=apply_physical_source_mesh(app,solids)
+        mesh=apply_physical_source_mesh(app,solids,plan=plan)
         setup_name=_steady_setup(app,max_iterations)
         if not app.save_project():
             raise RuntimeError("AEDT project cannot be saved")
+        save_state(spec.case_id,"CHT_MESHING",stage_start_epoch=time.time())
+        scratch_before={p.name for p in (RUNS/"native_solver_tmp").glob("icepak_*.pjt") if p.is_dir()}
+        mesh_started=time.time()
+        if not app.mesh.generate_mesh(setup_name):
+            raise RuntimeError("NATIVE_MESH_GENERATION_FAILED")
+        mesh_proof=_native_mesh_audit(app,workspace,plan,setup_name,
+                                     scratch_before=scratch_before,mesh_started=mesh_started)
+        print("NATIVE_MESH_PRE_SOLVE_PASS",spec.case_id,json.dumps(mesh_proof),flush=True)
+        save_state(spec.case_id,"CHT_SOLVING",stage_start_epoch=time.time(),
+                   native_mesh_audit=mesh_proof)
         ok=app.analyze_setup(setup_name,cores=int(cores),tasks=int(cores),
                              use_auto_settings=False,blocking=True)
         if not ok:
@@ -480,8 +636,32 @@ def run_native_cht(spec,plan,workspace,cores=4,max_iterations=450):
             time.sleep(3)
         else:
             raise RuntimeError("Icepak completed but native restart pair missing")
+        from native_io import early_native_source_occupancy
+        try:
+            source_zone_proof=early_native_source_occupancy(mesh_file,plan)
+        except Exception as exc:
+            diagnostic=getattr(exc,"diagnostic",{"detail":str(exc)})
+            (workspace/"NATIVE_MESH_AUDIT.json").write_text(json.dumps({
+                "stage":"AFTER_CHT","case_id":spec.case_id,
+                "code":getattr(exc,"code",type(exc).__name__),"diagnostic":diagnostic},indent=2)+"\n",encoding="utf-8")
+            raise
+        print("NATIVE_SOURCE_VOLUME_PRECHECK",spec.case_id,
+              json.dumps(source_zone_proof),flush=True)
         convergence=_native_convergence_receipt(app,max_iterations)
-        print("NATIVE_CONVERGENCE",spec.case_id,
+        print("NATIVE_CONVERGENCE_INITIAL",spec.case_id,
+              json.dumps(convergence),flush=True)
+        # The production gate continues this exact Fluent restart field for
+        # five measured Source-cell temperature snapshots spanning 40 steps.
+        # Residual magnitudes remain diagnostics; only the final verified field
+        # can enter the ordinary interface sampler and publication path.
+        from physical_convergence import verify_and_continue
+        expected_source_zones={
+            "bottom":[s.name+"_solid" for s in spec.sources if s.layer=="bottom"],
+            "top":[s.name+"_solid" for s in spec.sources if s.layer=="top"]}
+        convergence=verify_and_continue(
+            workspace,convergence,int(cores),expected_source_zones)
+        mesh_file,data_file=find_native_pair(workspace)
+        print("NATIVE_CONVERGENCE_PHYSICAL",spec.case_id,
               json.dumps(convergence),flush=True)
         yield {"status":"SOLVED","case_id":spec.case_id,
                 "project":str(project_path),"setup":setup_name,

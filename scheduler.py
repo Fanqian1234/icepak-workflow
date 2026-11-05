@@ -1,276 +1,326 @@
-"""One bounded, subprocess-isolated CHT queue; no runtime code patches.
-
-Resource admissions are measured at launch, not a sum of double-counted
-hypothetical memory peaks. Pending Cases hold no execution slot. A failed
-Case is recorded once and never gets a Case-specific recovery branch.
-"""
+"""The single local queue: live request refresh, bounded failure isolation and safe drain."""
 from __future__ import annotations
-
 import csv
+import ctypes
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-
 import psutil
-
 from case_spec import load_cases
-from publish import (cleanup_case_work,free_disk_bytes,read_state,
-                     recover_terminal_workspaces,save_state)
-from settings import (CASE_MASTER, GIB, SAMPLES, STATE, WORK,
-                      completed_rerun_ids, has_accepted_transfer,
-                      legacy_reserved_status, policy_from_environment)
-
+from publish import (read_state,save_state,cleanup_case_work,recover_terminal_workspaces,
+                     free_disk_bytes,owner_alive,live_native_for_case)
+from settings import (CASE_MASTER,STATE,WORK,SAMPLES,GIB,QUEUE_FILE,PAUSE_FILE,
+                      CODE_REVISION,MESH_REVISION,completed_rerun_ids,has_accepted_transfer,
+                      paired_interface_published,active_case_workers,legacy_reserved_status,
+                      policy_from_environment,production_signature)
 CODE=Path(__file__).resolve().parent
 
-
-def _queue_lock():
-    """Prohibit concurrent schedulers in this new production code directory."""
-    STATE.mkdir(parents=True,exist_ok=True)
-    lock=STATE/"scheduler.lock"
-    try:
-        fd=os.open(lock,os.O_WRONLY|os.O_CREAT|os.O_EXCL)
-    except FileExistsError:
+def _foreign_workers(active):
+    """Count distinct physical Cases, never double-count Python launch wrappers."""
+    seen=set(active)
+    owned={entry[0].pid for entry in active.values()}
+    foreign={}
+    for pid,case_id,_ in active_case_workers():
+        if pid in owned or case_id in seen:
+            continue
+        seen.add(case_id)
+        foreign[pid]=case_id
+    # Native children may outlive a crashed Python worker. They still
+    # consume the same Case slot, but idle license-only AEDT windows do not.
+    prefix=str(WORK.resolve()).lower().replace(chr(92),"/")+"/"
+    for proc in psutil.process_iter(["name","cmdline"]):
         try:
-            pid=int(lock.read_text().strip())
-        except (OSError,ValueError):
-            pid=0
-        if pid and psutil.pid_exists(pid):
-            raise RuntimeError(f"New CHT scheduler already running, pid {pid}")
-        lock.unlink(missing_ok=True)
-        fd=os.open(lock,os.O_WRONLY|os.O_CREAT|os.O_EXCL)
-    os.write(fd,str(os.getpid()).encode())
-    os.close(fd)
-    return lock
+            if (proc.info.get("name") or "").lower()!="ansysedt.exe":continue
+            command=" ".join(proc.info.get("cmdline") or []).lower().replace(chr(92),"/")
+            match=re.search(re.escape(prefix)+r"(case_\d+)(?:/|\s|$)",command)
+            if not match or match[1] in seen:continue
+            if any(child.name().lower() in ("fluent.exe","hdm.exe","icepakcomengine.exe")
+                   or child.name().lower().startswith("fl_mpi")
+                   for child in proc.children(recursive=True)):
+                foreign[proc.pid]=match[1];seen.add(match[1])
+        except (psutil.Error,OSError):continue
+    return foreign
 
-
-def _recover_orphaned_workers():
-    """Reclaim only private workspaces whose owning worker has died."""
-    if not WORK.is_dir():
-        return 0
-    reclaimed=0
-    for folder in WORK.iterdir():
-        if not folder.is_dir() or not re.fullmatch(r"case_\d+",folder.name):
-            continue
-        record=read_state(folder.name)
-        if record.get("status") in {"FAILED","PUBLISHED"}:
-            continue
-        marker=folder/"OWNER.pid"
-        if not marker.is_file() and not record:
-            continue
-        try:
-            owner=int(marker.read_text(encoding="ascii").strip())
-        except (OSError,ValueError):
-            owner=record.get("owner_pid") or 0
-        if isinstance(owner,int) and owner>0 and psutil.pid_exists(owner):
-            continue
-        save_state(folder.name,"FAILED",reason="Worker process ended before publication")
-        try:
-            reclaimed+=bool(cleanup_case_work(folder.name,failed=True))
-        except OSError as error:
-            # Windows may keep an AEDT log handle after its worker has died.
-            # One locked file must never prevent admission of other Cases.
-            print("CLEANUP_DEFERRED",folder.name,str(error),flush=True)
-    return reclaimed
-
+def _windows_free_commit_gib():
+    """Actual Windows remaining commit, not another RAM reservation."""
+    if os.name!="nt":
+        return None
+    class MemoryStatus(ctypes.Structure):
+        _fields_=[("length",ctypes.c_uint32),
+                  ("load",ctypes.c_uint32),
+                  ("total_physical",ctypes.c_uint64),
+                  ("free_physical",ctypes.c_uint64),
+                  ("total_commit",ctypes.c_uint64),
+                  ("free_commit",ctypes.c_uint64),
+                  ("total_virtual",ctypes.c_uint64),
+                  ("free_virtual",ctypes.c_uint64),
+                  ("extended_virtual",ctypes.c_uint64)]
+    status=MemoryStatus()
+    status.length=ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(
+            ctypes.byref(status)):
+        raise OSError("Cannot read Windows available commit")
+    return status.free_commit/GIB
 
 def _readiness(policy,active_count=0):
-    # Never double-charge running tasks' observed RAM. It is already excluded
-    # from psutil.available. Disk admission also budgets for future growth
-    # across all live workspaces before launching the next worker.
+    # RAM is already net of live processes: do not reserve it twice.
+    # Windows may run out of COMMIT while RAM still appears plentiful;
+    # commit is an independent measured admission signal.
     memory=psutil.virtual_memory().available/GIB
+    commit=_windows_free_commit_gib()
     disk=free_disk_bytes()/GIB
     future_disk=policy.projected_workspace_gib*(active_count+1)
     ok=(memory>=policy.minimum_free_memory_gib and
+        (commit is None or commit>=8.0) and
         disk>=policy.minimum_free_disk_gib+future_disk)
     return ok,{"free_memory_gib":round(memory,1),
+               "free_commit_gib":round(commit,1) if commit is not None else None,
                "free_disk_gib":round(disk,1),
                "future_disk_budget_gib":round(future_disk,1)}
 
-
-def _stop_owned_tree(pid):
-    """Timeout applies only to the worker and subprocesses it launched."""
+def _queue_lock():
+    """An OS lock, automatically released on death; PID reuse cannot wedge it."""
+    import msvcrt
+    STATE.mkdir(parents=True,exist_ok=True)
+    handle=(STATE/"scheduler.lock").open("a+b")
     try:
-        parent=psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return True
-    tree=parent.children(recursive=True)
-    for proc in tree+[parent]:
-        try: proc.terminate()
-        except psutil.NoSuchProcess: pass
-    _,alive=psutil.wait_procs(tree+[parent],timeout=10)
-    for proc in alive:
-        try: proc.kill()
-        except psutil.NoSuchProcess: pass
-    _,still_alive=psutil.wait_procs(alive,timeout=5)
-    return not still_alive
+        handle.seek(0,2)
+        if handle.tell()==0:handle.write(b"0\n");handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
+        handle.seek(0);handle.write((str(os.getpid())+"\n").encode("ascii"));handle.truncate();handle.flush()
+        return handle
+    except Exception:
+        handle.close();raise RuntimeError("Another production manager holds scheduler.lock")
+
+
+def _unlock(handle):
+    import msvcrt
+    try:
+        handle.seek(0);handle.write(b"0\n");handle.truncate();handle.flush()
+        handle.seek(0);msvcrt.locking(handle.fileno(),msvcrt.LK_UNLCK,1)
+    finally:handle.close()
+
+
+def read_requests(path):
+    raw=Path(path).read_text(encoding="utf-8-sig")
+    ids=[x.strip() for x in raw.splitlines() if x.strip() and not x.lstrip().startswith("#")]
+    if len(ids)!=len(set(ids)) or any(not re.fullmatch(r"case_\d+",x) for x in ids):
+        raise ValueError("Invalid or duplicate physical Case IDs in persistent queue")
+    return ids
+
+
+def append_requests(path,ids):
+    path=Path(path);previous=path.read_bytes() if path.is_file() else None
+    original=read_requests(path) if previous is not None else []
+    cases,invalid=load_cases()
+    for cid in ids:
+        if not re.fullmatch(r"case_\d+",cid) or cid not in cases or cid in invalid:
+            raise ValueError("Invalid requested Case "+str(cid))
+        if not cases[cid].eligible:raise ValueError("Excluded physical Case "+cid)
+    merged=original+[cid for cid in dict.fromkeys(ids) if cid not in original]
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_name(path.name+".pending")
+    if tmp.exists():raise RuntimeError("Another request-list update is in progress")
+    try:
+        with tmp.open("x",encoding="utf-8",newline="") as stream:
+            stream.write("\n".join(merged)+"\n");stream.flush();os.fsync(stream.fileno())
+        if (path.read_bytes() if path.is_file() else None)!=previous:
+            raise RuntimeError("Request list changed concurrently")
+        os.replace(tmp,path)
+    finally:tmp.unlink(missing_ok=True)
+    return merged
+
+
+def _failure(cid,code,error):
+    record=read_state(cid)
+    if record.get("status")=="STATE_CORRUPT":return
+    try:
+        save_state(cid,"FAILED",failure_code=code,reason=str(error),
+                   error_type=type(error).__name__,code_revision=CODE_REVISION)
+    except OSError as exc:
+        print("CASE_STATE_WRITE_DEFERRED",cid,str(exc),flush=True)
+
+
+def _recover_orphaned_workers():
+    if not WORK.is_dir():return 0
+    recovered=0
+    for folder in WORK.iterdir():
+        cid=folder.name
+        if not folder.is_dir() or not re.fullmatch(r"case_\d+",cid):continue
+        record=read_state(cid)
+        if record.get("status") in ("PUBLISHED","FAILED","STATE_CORRUPT"):continue
+        if not record or owner_alive(record) or live_native_for_case(cid,record):continue
+        _failure(cid,"WORKER_EXITED_BEFORE_PUBLICATION",RuntimeError("Worker exited; native evidence retained"))
+        recovered+=1
+    return recovered
 
 
 def _admission_list(ids=None):
     cases,invalid=load_cases()
-    # The formal master owns Case identity; the feature table owns physics.
-    # Verify this small CSV contract once per scheduler admission.
-    with CASE_MASTER.open(encoding="utf-8-sig",newline="") as source:
-        official=[row["case_id"] for row in csv.DictReader(source)]
-    feature_ids=set(cases)|set(invalid)
-    if len(official)!=len(set(official)) or set(official)!=feature_ids:
-        raise RuntimeError("CASE_MASTER and CASE_FEATURES differ in Case IDs")
-    completed=completed_rerun_ids()
-    requested=list(ids) if ids is not None else sorted(official)
-    selected=[]
-    seen=set()
+    with CASE_MASTER.open(encoding="utf-8-sig",newline="") as stream:
+        official=[row["case_id"] for row in csv.DictReader(stream)]
+    if len(official)!=len(set(official)) or set(official)!=(set(cases)|set(invalid)):
+        raise RuntimeError("CASE_MASTER and CASE_FEATURES identities disagree; global admission paused")
+    requested=list(dict.fromkeys(ids)) if ids is not None else sorted(official)
+    old_done=completed_rerun_ids();fresh=[];repair=[]
     for cid in requested:
-        if cid in seen:
+        if cid in old_done or paired_interface_published(cid) or has_accepted_transfer(cid):continue
+        record=read_state(cid);status=record.get("status")
+        if status=="STATE_CORRUPT":continue
+        if cid not in cases or cid in invalid:
+            why=invalid.get(cid,"Case ID is absent from the physical catalog")
+            if status!="INPUT_INVALID" or record.get("reason")!=why:
+                try:save_state(cid,"INPUT_INVALID",reason=why,code_revision=CODE_REVISION)
+                except OSError:pass
             continue
-        seen.add(cid)
-        if cid in completed or has_accepted_transfer(cid):
-            continue
-        if legacy_reserved_status(cid):
-            continue
-        if cid in invalid:
-            if ids is None:
-                continue  # Incomplete legacy geometry never blocks other Cases.
-            raise ValueError(cid+": "+invalid[cid])
-        if cid not in cases:
-            raise KeyError("Unknown Case ID "+cid)
-        if not cases[cid].eligible:
-            continue
-        state=read_state(cid)
-        status=state.get("status")
+        if not cases[cid].eligible:continue
+        if owner_alive(record) or live_native_for_case(cid,record):continue
         if status=="PUBLISHED":
-            continue
-        if (WORK/cid).exists():
-            # A dead AEDT engine can leave a locked file in terminal work.
-            # Retry cleanup on the next queue pass; never launch into it.
-            print("CASE_SKIP_WORKSPACE_CLEANUP_PENDING",cid,flush=True)
-            continue
-        # FAILED is not a completed rerun. A new queue invocation must
-        # reconsider it after common code fixes; each selected ID is still
-        # visited at most once during this queue invocation.
-        if status in {"MODELED","SOLVED","SAMPLED","FOUR_T0_READY"}:
-            owner=state.get("owner_pid")
-            if isinstance(owner,int) and psutil.pid_exists(owner):
-                continue
-        selected.append(cid)
-    return selected,len(invalid)
+            print("INCOMPLETE_PUBLISHED_BUNDLE_REQUIRES_REPAIR",cid,flush=True);continue
+        if status=="FAILED":
+            physical=str(record.get("reason","")).startswith(("NATIVE_","Source","Native"))
+            same=(record.get("mesh_revision")==MESH_REVISION if physical
+                  else record.get("code_revision")==CODE_REVISION)
+            if same and not record.get("retry_requested",False):continue
+            repair.append(cid)
+        else:fresh.append(cid)
+    return fresh+repair,len(invalid)
 
 
-def run_queue(ids=None):
-    policy=policy_from_environment()
-    lock=_queue_lock()
-    active={}
-    launched=0
-    passed=0
-    failed=0
-    pending=[]
-    last_wait_note=0
-    last_cleanup_attempt=0.0
-    last_launch=0.0
-    max_tasks=min(policy.max_parallel,
-                  max(1,(psutil.cpu_count(logical=True) or os.cpu_count() or 4)
-                      //policy.cores_per_case))
+def _progress(cid,record):
+    cpu=0.;io=0;birth=None
+    pid=record.get("owner_pid")
+    if owner_alive(record):
+        try:
+            proc=psutil.Process(pid);birth=proc.create_time()
+            for child in [proc,*proc.children(recursive=True)]:
+                try:
+                    ct=child.cpu_times();cpu+=ct.user+ct.system
+                    ct=child.io_counters();io+=ct.read_bytes+ct.write_bytes
+                except psutil.Error:pass
+        except psutil.Error:pass
+    return {"case_id":cid,"owner_pid":pid,"owner_birth":birth,"stage":record.get("status"),
+            "cpu_seconds":round(cpu,3),"io_bytes":io,"state_updated":record.get("updated_epoch")}
+
+
+def _write_snapshot(status,requested,active,foreign,pending,deferred,counters,resources,progress,error=None):
+    body={"status":status,"updated_epoch":time.time(),"pid":os.getpid(),
+          "birth":psutil.Process().create_time(),"code_revision":CODE_REVISION,
+          "requested_count":len(requested),"active_cases":list(active),
+          "foreign_cases":sorted(set(foreign.values())),"pending":list(pending),
+          "deferred":dict(deferred),"counts":dict(counters),"resources":resources,
+          "progress":progress,"error":error}
+    target=STATE/"QUEUE_STATE.json";tmp=STATE/".QUEUE_STATE.pending"
+    try:
+        tmp.write_text(json.dumps(body,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        os.replace(tmp,target)
+    except OSError as exc:print("QUEUE_STATUS_WRITE_DEFERRED",str(exc),flush=True)
+
+
+def run_queue(ids=None,queue_file=None,*,_max_cycles=None):
+    """One Case failure cannot terminate dispatch; pause drains without killing."""
+    policy=policy_from_environment();handle=_queue_lock()
+    active={};pending=[];attempted=set();deferred={};foreign={};resources={}
+    counts={"launched":0,"passed":0,"failed":0,"invalid_input_cases":0}
+    loaded_signature=production_signature();last_refresh=-1e30;last_status=-1e30
+    requested=[];last_request_stamp=None;progress={};last_progress={};error=None;cycles=0
+    max_tasks=min(policy.max_parallel,max(1,(psutil.cpu_count() or 4)//policy.cores_per_case))
     try:
         _recover_orphaned_workers()
-        recover_terminal_workspaces()
-        selected,invalid_count=_admission_list(ids)
-        if not selected:
-            return {"passed":0,"failed":0,"pending":0,
-                    "invalid_input_cases":invalid_count}
-        pending=list(selected)
-        print(f"QUEUE_START pending={len(pending)} slots={max_tasks} "
-              f"per_case_cores={policy.cores_per_case}",flush=True)
-        while pending or active:
-            completed_any=False
-            for cid,(process,handle,start) in tuple(active.items()):
-                code=process.poll()
-                if code is None and time.monotonic()-start > (
-                        policy.native_timeout_minutes*60):
-                    print(f"CASE_TIMEOUT {cid}",flush=True)
-                    if not _stop_owned_tree(process.pid):
-                        raise RuntimeError("Timed-out worker tree is still alive; "
-                                           "refusing unsafe cleanup")
-                    save_state(cid,"FAILED",reason="Native worker timeout")
-                    cleanup_case_work(cid,failed=True)
-                    code=124
-                if code is None:
-                    continue
-                handle.close()
-                active.pop(cid)
-                completed_any=True
-                if code==0 and read_state(cid).get("status")=="PUBLISHED":
-                    passed+=1
-                    (STATE/f"{cid}.log").unlink(missing_ok=True)
-                    print(f"CASE_PASS {cid} total_passed={passed}",flush=True)
+        while True:
+            cycles+=1;completed=False;now=time.monotonic()
+            # Reap first, then reclaim only after the corresponding worker died.
+            for cid,(proc,log,started,birth) in tuple(active.items()):
+                code=proc.poll()
+                if code is None:continue
+                try:log.close()
+                except OSError:pass
+                active.pop(cid);completed=True
+                if paired_interface_published(cid):
+                    counts["passed"]+=1
+                    try:
+                        save_state(cid,"PUBLISHED",output=str(__import__('settings').PUBLISHED/cid),cleanup_pending=True)
+                        cleaned=cleanup_case_work(cid,active_ids=active)
+                        if cleaned:save_state(cid,"PUBLISHED",cleanup_pending=False)
+                        stage=SAMPLES/cid
+                        if cleaned and stage.is_dir():shutil.rmtree(stage)
+                    except (OSError,ValueError,RuntimeError) as exc:
+                        print("ACCEPTED_CASE_CLEANUP_DEFERRED",cid,str(exc),flush=True)
+                    print("CASE_PASS",cid,"passed",counts["passed"],flush=True)
                 else:
-                    failed+=1
-                    print(f"CASE_FAIL {cid} exit={code} total_failed={failed}",
-                          flush=True)
-            if completed_any:
-                # Reclaim native projects only AFTER the worker has exited.
-                # A locked file is deferred without terminating the queue.
+                    counts["failed"]+=1
+                    if read_state(cid).get("status") not in ("FAILED","STATE_CORRUPT","INPUT_INVALID"):
+                        _failure(cid,"WORKER_EXITED_WITHOUT_COMPLETE_BUNDLE",RuntimeError(f"Worker exit={code}"))
+                    print("CASE_FAIL_CONTINUE",cid,"exit",code,flush=True)
+            foreign=_foreign_workers(active)
+            changed=production_signature()!=loaded_signature
+            draining=PAUSE_FILE.exists() or changed
+            if changed:error="CODE_CHANGED: drain required before adopting a different release"
+            if draining:
+                if not active and not foreign:
+                    _write_snapshot("DRAINED",requested,active,foreign,[],deferred,counts,resources,progress,error)
+                    return dict(counts,status="DRAINED",pending=0)
+                pending=[]
+            elif completed or now-last_refresh>=30 or not requested:
                 try:
-                    cleaned=recover_terminal_workspaces(active_ids=active)
-                    if cleaned:
-                        print("CLEANUP_RELEASED",cleaned,flush=True)
-                except OSError as error:
-                    print("CLEANUP_DEFERRED",str(error),flush=True)
-            while pending and len(active)<max_tasks:
-                # Four starters are immediate; remaining workers ramp up to
-                # prevent 20 simultaneous AEDT launches and memory spikes.
-                if len(active)>=4 and (
-                        time.monotonic()-last_launch <
-                        policy.launch_spacing_seconds):
-                    break
-                ready,resources=_readiness(policy,len(active))
-                if not ready:
-                    if time.monotonic()-last_cleanup_attempt>=30:
-                        try:
-                            recover_terminal_workspaces(active_ids=active)
-                        except OSError as error:
-                            print("CLEANUP_DEFERRED",str(error),flush=True)
-                        last_cleanup_attempt=time.monotonic()
-                    ready,resources=_readiness(policy,len(active))
-                    if not ready:
-                        if time.monotonic()-last_wait_note>=30:
-                            print("WAIT_RESOURCES",resources,flush=True)
-                            last_wait_note=time.monotonic()
-                        break
+                    if queue_file is not None:
+                        requested=read_requests(queue_file)
+                    else:requested=list(ids) if ids is not None else read_requests(QUEUE_FILE)
+                    selected,invalid=_admission_list(requested)
+                    counts["invalid_input_cases"]=invalid
+                    pending=[cid for cid in selected if cid not in attempted and cid not in active and cid not in foreign.values()]
+                    error=None
+                except (OSError,ValueError,KeyError,RuntimeError) as exc:
+                    pending=[];error=f"ADMISSION_CONFIG_ERROR: {exc}"
+                last_refresh=now
+            while not draining and not error and pending and len(active)+len(foreign)<max_tasks:
+                ready,resources=_readiness(policy,len(active)+len(foreign))
+                if not ready:break
                 cid=pending.pop(0)
-                # Recheck immediately before launch: the old manager may have
-                # claimed this Case after our initial queue admission.
-                legacy=legacy_reserved_status(cid)
-                if legacy:
-                    print("CASE_SKIP_LEGACY_RESERVED",cid,legacy,flush=True)
-                    continue
-                log=(STATE/f"{cid}.log").open("w",encoding="utf-8")
-                cmd=[sys.executable,"-B",str(CODE/"main.py"),
-                     "case",cid,"--worker",
-                     "--cores",str(policy.cores_per_case)]
+                if paired_interface_published(cid) or has_accepted_transfer(cid):continue
+                if legacy_reserved_status(cid) or live_native_for_case(cid):
+                    deferred[cid]="LIVE_NATIVE_OWNER";continue
+                attempted.add(cid)
+                # Failed/unaccepted work is kept. Its exact reason is visible,
+                # and it does not rotate endlessly through the runnable queue.
+                if (WORK/cid).exists() or (SAMPLES/cid).exists():
+                    deferred[cid]="REPAIR_WORKSPACE_RETAINED";continue
+                log=None
                 try:
-                    proc=subprocess.Popen(cmd,cwd=str(CODE),
-                                          stdout=log,stderr=subprocess.STDOUT,
-                                          close_fds=True)
-                except Exception:
-                    log.close()
-                    raise
-                active[cid]=(proc,log,time.monotonic())
-                last_launch=time.monotonic()
-                launched+=1
-                print("CASE_LAUNCH",cid,"pid",proc.pid,"running",len(active),
-                      flush=True)
-            # Pending work holds no parallel slot. Keep the scheduler alive
-            # when temporarily blocked on disk/RAM, and retry automatically.
-            # The existing WAIT_RESOURCES line is throttled to one per 30 s.
-            if pending or active:
-                time.sleep(policy.poll_seconds)
-        return {"passed":passed,"failed":failed,"pending":len(pending),
-                "launched":launched,"invalid_input_cases":invalid_count}
+                    log=(STATE/f"{cid}.log").open("w",encoding="utf-8")
+                    cmd=[sys.executable,"-B",str(CODE/"main.py"),"case",cid,"--worker","--cores",str(policy.cores_per_case)]
+                    options={"creationflags":subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=="nt" else {"start_new_session":True}
+                    proc=subprocess.Popen(cmd,cwd=str(CODE),stdout=log,stderr=subprocess.STDOUT,close_fds=True,**options)
+                    birth=psutil.Process(proc.pid).create_time()
+                    active[cid]=(proc,log,time.monotonic(),birth);counts["launched"]+=1
+                    print("CASE_LAUNCH",cid,"pid",proc.pid,"birth",birth,flush=True)
+                except (OSError,psutil.Error,RuntimeError) as exc:
+                    if log is not None:log.close()
+                    _failure(cid,"WORKER_LAUNCH_FAILED",exc);deferred[cid]=str(exc)
+                    counts["failed"]+=1
+                    print("CASE_LAUNCH_FAILED_CONTINUE",cid,str(exc),flush=True)
+            if now-last_status>=15 or completed:
+                for cid in set(active)|set(foreign.values()):
+                    p=_progress(cid,read_state(cid));old=progress.get(cid)
+                    if old is None or any(p.get(k)!=old.get(k) for k in ("cpu_seconds","io_bytes","stage","state_updated")):
+                        last_progress[cid]=time.time()
+                    p['seconds_without_progress']=round(time.time()-last_progress.get(cid,time.time()),1)
+                    p['stalled_suspect']=p['seconds_without_progress']>=600
+                    progress[cid]=p
+                status=("DRAINING" if draining else "ADMISSION_BLOCKED" if error else
+                        "RUNNING" if active or foreign else "WAIT_RESOURCES" if pending else "IDLE_REPAIR_BACKLOG")
+                _write_snapshot(status,requested,active,foreign,pending,deferred,counts,resources,progress,error)
+                last_status=now
+            if _max_cycles is not None and cycles>=_max_cycles:return dict(counts,pending=len(pending))
+            time.sleep(policy.poll_seconds)
     finally:
-        # A normal exception must not silently orphan a controller that owns
-        # live workers. Leave their Python children running to finish; their
-        # PID and Case state remain explicit rather than killing external AEDT.
-        for process,handle,_ in active.values():
-            handle.close()
-        lock.unlink(missing_ok=True)
+        for proc,log,started,birth in active.values():
+            try:log.close()
+            except OSError:pass
+        _unlock(handle)

@@ -49,10 +49,29 @@ def accept_sample(spec, proof: dict):
         raise ValueError("Native fin and channel volume cells were not verified")
     if proof.get("native_solid_cells",{}).get("status")!="PASS_NATIVE_SOLID_CELLS":
         raise ValueError("Native package, Source and FEOL volume cells were not verified")
+    # The historic successful-110 physical convergence contract is mandatory.
+    # Residuals are diagnostic; neither a normal Icepak exit nor a 450-step
+    # cutoff establishes conservation or temperature stability.
+    convergence=proof.get("native_convergence") or {}
+    if (convergence.get("status")!="MEASURED" or
+            not 0<int(convergence.get("iterations") or 0)<=450):
+        raise ValueError("Measured native iteration evidence is missing")
+    mass=proof.get("mass_balance") or {}
+    if (mass.get("status")!="MEASURED" or
+            not math.isfinite(float(mass.get("relative_imbalance",float("inf")))) or
+            float(mass["relative_imbalance"])>0.001):
+        raise ValueError("Native inlet/outlet mass imbalance exceeds 0.1% or lacks proof")
+    stability=proof.get("source_temperature_stability") or {}
+    if (stability.get("status")!="MEASURED" or
+            int(stability.get("sampled_window_iterations") or 0)<40 or
+            not math.isfinite(float(stability.get("max_temperature_range_K",float("inf")))) or
+            float(stability["max_temperature_range_K"])>0.5):
+        raise ValueError("Native Source temperature has not stabilized for 40 iterations")
     energy=proof.get("package_energy",{})
     if (energy.get("status")!="PASS" or
-            energy.get("relative_error",1)>0.05):
-        raise ValueError("Native package top+bottom energy balance not admitted")
+            not math.isfinite(float(energy.get("relative_error",float("inf")))) or
+            float(energy["relative_error"])>0.005):
+        raise ValueError("Native package energy imbalance exceeds 0.5% or lacks proof")
     sink_contact=proof.get("sink_contact",{})
     if sink_contact.get("status")!="PASS":
         raise ValueError("Native fin/air direct and NCI contact area not verified")

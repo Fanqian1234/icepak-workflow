@@ -658,8 +658,14 @@ def _source_interface(native,plan,layer,scalar,n=128):
         if (area_error>0.01 or float(ratio.mean())<0.99 or
                 float(core.min())<0.90 or float(ratio.max())>1.10 or
                 np.any(coverage<=0)):
-            raise RuntimeError("NATIVE_SOURCE_INTERFACE_SIDE_COVERAGE: "+
-                               layer+" "+side)
+            raise RuntimeError(
+                f"NATIVE_SOURCE_INTERFACE_SIDE_COVERAGE: {layer} {side} "
+                f"native_area_error={native_error:.6g} "
+                f"sampled_area_error={area_error:.6g} "
+                f"mean={float(ratio.mean()):.6g} "
+                f"core_min={float(core.min()):.6g} "
+                f"max={float(ratio.max()):.6g} "
+                f"zero_pixels={int(np.count_nonzero(coverage<=0))}")
         temperature=(np.asarray(
             overlap.T@np.asarray([row[1] for row in rows])).ravel()/coverage)
         if not np.isfinite(temperature).all():
@@ -751,6 +757,8 @@ def sample_native_case(spec,plan,workspace,output,*,fin_gate=None,
     output.mkdir(parents=True,exist_ok=True)
     mesh,data=find_native_pair(workspace)
     native=read_surface_context(mesh,data)
+    from native_io import opening_mass_balance
+    mass_balance=opening_mass_balance(native,data)
     # Every package and Source solid must occupy real Fluent volume cells.
     native_solids=_native_solid_presence(native,plan)
     # Native face-area proof is mandatory, not a diagnostic-only routine.
@@ -765,6 +773,9 @@ def sample_native_case(spec,plan,workspace,output,*,fin_gate=None,
            "native_solid_cells":native_solids,
            "sink_contact":sink_contact,
            "native_convergence":native_convergence,
+           "mass_balance":mass_balance,
+           "source_temperature_stability":(native_convergence or {}).get(
+               "source_temperature_stability"),
            "package_energy":energy,
            "gamma":{},"source":{}}
     for n in (80,40):
