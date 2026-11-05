@@ -522,17 +522,30 @@ def _native_mesh_audit(app,workspace,plan,setup_name,*,scratch_before=(),mesh_st
         roots.extend(newdirs)
     roots=list(dict.fromkeys(p.resolve() for p in roots))
     candidates=[];statistics=[]
-    # ExportMeshStats is a native API; preserve its report even when its text
-    # schema is not the HDM table consumed below.
-    exported=workspace/"native_mesh_stats.ms"
-    try:app.export_mesh_stats(setup_name,output_file=str(exported))
-    except Exception as error:print("MESH_STATS_EXPORT_DIAGNOSTIC",type(error).__name__,str(error),flush=True)
-    if exported.is_file():statistics.append(exported)
+    # AEDT 2023 R2's ExportMeshStats macro is broken for Icepak designs
+    # (it requests the Electronics Voltage/Current property).  It is useful
+    # only as an opt-in diagnostic and must never be part of the production
+    # preflight path.
+    if os.environ.get("NEURALCHT_ENABLE_EXPORT_MESH_STATS","0").lower() in {"1","true","yes"}:
+        exported=workspace/"native_mesh_stats.ms"
+        try:app.export_mesh_stats(setup_name,output_file=str(exported))
+        except Exception as error:print("MESH_STATS_EXPORT_DIAGNOSTIC",type(error).__name__,str(error),flush=True)
+        if exported.is_file():statistics.append(exported)
     for root in roots:
         if not root.is_dir():continue
         for name in ("current.nc_cas",setup_name+".nc_cas",setup_name+".cas"):
             candidates.extend(root.rglob(name))
         statistics.extend(root.glob("grid_stats_*"))
+    # GenerateMesh returns before the result tree is fully flushed on some
+    # AEDT 2023 R2 sessions.  Wait only when the caller explicitly requests a
+    # production wait; unit tests and pure diagnostics remain immediate.
+    wait_seconds=float(os.environ.get("NEURALCHT_MESH_OUTPUT_WAIT_SEC","90"))
+    if wait_seconds>0 and mesh_started is not None:
+        deadline=time.monotonic()+wait_seconds
+        while time.monotonic()<deadline:
+            if any(p.is_file() and p.stat().st_size for root in roots if root.is_dir() for p in root.rglob("*.nc_cas")):
+                break
+            time.sleep(2)
     proof=None;failures=[]
     for path in sorted(set(candidates),key=lambda p:(not p.name.endswith(".nc_cas"),str(p))):
         if not path.is_file() or not path.stat().st_size:continue

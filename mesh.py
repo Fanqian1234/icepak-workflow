@@ -53,9 +53,14 @@ def counts_for_bbox(name,box):
         xy=[40,40]
         z=3
     elif name in ("Bump","HB","Die"):
-        # The proved Source-adjacent grid from parametric_source_mesh.
-        xy=[min(80,max(4,math.ceil(extents[i]/.25-1e-9))) for i in (0,1)]
-        z=min(80,max(2,math.ceil(extents[2]/.005-1e-9)))
+        # These solids cannot rely on the global mesh.  In AEDT 2023 R2 the
+        # global grid may retain the visible Source CAD while emitting no
+        # native volume zone for the 10-um package stack.  Give the three
+        # adjacent solids an explicit, bounded local grid so the Source/FEOL
+        # interfaces are represented by real Fluent cells.  The shared core
+        # region still supplies the common contact contract.
+        xy=[min(40,max(8,math.ceil(extents[i]/.5-1e-9))) for i in (0,1)]
+        z=max(2,math.ceil(extents[2]/.01-1e-9))
     elif name=="TIM1":
         xy=[min(72,max(6,math.ceil(extents[i]/.4))) for i in (0,1)]
         z=max(1,math.ceil(extents[2]/.06))
@@ -186,7 +191,7 @@ def apply_physical_source_mesh(app,object_names,package_conduction=False,*,plan)
         raise RuntimeError("Native mesh has no authoritative CAD-plan solid")
     if "Region" in available:
         raise RuntimeError("Default AEDT Region overlaps the physical CHT domain")
-    required = {"Bump","HB","Die"}
+    required = {"Bump","HB","Die","TIM1"}
     if not required.issubset(available):
         raise ValueError("Required Bump/HB/Die material solids unavailable")
     missing = set(object_names)-available
@@ -196,13 +201,14 @@ def apply_physical_source_mesh(app,object_names,package_conduction=False,*,plan)
     feol = {n for n in available if n.startswith("Passive_FEOL_")}
     if not sources or not feol:
         raise ValueError("Physical Source and FEOL complement must exist before meshing")
-    # Preserve the old bulk-vs-local assignment: package and sink-base solids
-    # follow the single global setting, while only TIM2, Source/FEOL and
-    # fins receive explicit local boxes. Never refine the whole Die to
-    # 80x80x80 just to resolve its small Source-adjacent contact patches.
+    # Preserve the old bulk-vs-local assignment for the large sink and air,
+    # while the package stack, Source/FEOL, TIM2 and fins receive bounded
+    # local boxes. The package stack is included explicitly because a global
+    # mesh alone can omit thin Source-adjacent volume zones.
     all_solids = set(object_names)|required|sources|feol
+    package_core = {"Bump","HB","Die","TIM1"}
     solids = sorted(name for name in all_solids if (
-        name=="TIM2" or name.startswith("Heatsink_Fin_")
+        name in package_core or name=="TIM2" or name.startswith("Heatsink_Fin_")
         or name in sources or name in feol))
     if not package_conduction and "Air_Domain" not in available:
         raise ValueError("CHT must contain the genuine heatsink air channels")
