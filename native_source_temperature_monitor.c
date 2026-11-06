@@ -54,22 +54,17 @@ DEFINE_ON_DEMAND(nci_source_temperatures)
         count[i] = PRF_GISUM1(count[i]);
     }
 #endif
-    if (invalid ||
-        (NCI_BOTTOM_COUNT && (!count[0] || !(volume[0] > 0.0))) ||
-        (NCI_TOP_COUNT && (!count[1] || !(volume[1] > 0.0))))
+    if (invalid || !count[0] || !count[1] || !(volume[0] > 0.0) || !(volume[1] > 0.0))
         Error("NCI_SOURCE_TEMPERATURE_INVALID_NATIVE_CELLS\n");
     Message0("\nNCI_SOURCE_MONITOR_BINDING=%s\n", NCI_SOURCE_BINDING);
     Message0("NCI_SOURCE_MONITOR_CELLS bottom=%d top=%d volume_bottom=%.17g volume_top=%.17g\n",
              count[0], count[1], volume[0], volume[1]);
     Message0("THERMAL_MONITOR_BEGIN\n");
-    if (NCI_BOTTOM_COUNT) {
-        Message0("THERMAL_MONITOR_bottom_volume-avg\nNet %.17g\n", weighted[0] / volume[0]);
-        Message0("THERMAL_MONITOR_bottom_maximum\nNet %.17g\n", maximum[0]);
-    }
-    if (NCI_TOP_COUNT) {
-        Message0("THERMAL_MONITOR_top_volume-avg\nNet %.17g\n", weighted[1] / volume[1]);
-        Message0("THERMAL_MONITOR_top_maximum\nNet %.17g\n", maximum[1]);
-    }
+    Message0("THERMAL_MONITOR_bottom_volume-avg\nNet %.17g\n", weighted[0] / volume[0]);
+    Message0("THERMAL_MONITOR_bottom_maximum\nNet %.17g\n", maximum[0]);
+    Message0("THERMAL_MONITOR_top_volume-avg\nNet %.17g\n", weighted[1] / volume[1]);
+    Message0("THERMAL_MONITOR_top_maximum\nNet %.17g\n", maximum[1]);
     Message0("THERMAL_MONITOR_END\n");
 #endif
 }
+

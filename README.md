@@ -1,60 +1,141 @@
-# icepak-workflow
+# NeuralCHT 仿真生产约束与目录边界
 
-Windows + Ansys AEDT/Icepak 2023.2 的 NeuralCHT Icepak/Fluent 生产采样流水线。当前版本包含队列调度、原生 CHT、物理连续性验证、Source 原生温度监控、面积积分采样、准入验收和发布收据。
+本目录是本机唯一正式 Icepak workflow 源码目录。`main.py` 是唯一生产入口。目标是持续增加物理可信、采样完整、可正式发布的不同 Case；进程数量、Running 状态、单项 PASS 均不能代替真实产出。
 
-## 当前入口
+## 1. 目录与唯一权威
 
-```powershell
-python -B main.py plan case_XXXX
-python -B main.py enqueue --ids case_XXXX,case_YYYY
-python -B main.py queue --queue-file runs/state/REQUESTED_CASES.txt
-python -B main.py status
-python -B main.py drain
-python -B main.py resume
-python -B main.py cleanup
-python -B test_reliability.py
+```text
+D:\3DIC_model\
+├─ icepak_workflow\                 唯一正式生产代码、tests\ 回归测试、本说明
+├─ icepak_runs\                     运行数据；不放生产源码或候选代码
+│  ├─ state\                        Case 状态、日志、完成与跨主机排除清单、单管理器锁
+│  ├─ work\                         在途原生 CAD、网格、Fluent 场与本次求解证据
+│  ├─ native_solver_tmp\            原生求解器临时空间
+│  ├─ samples\                      通过发布前的采样暂存
+│  ├─ published\                    指向 case_new 的旧兼容 junction；不是第二份数据
+│  └─ t0_cache\                     身份一致的四档 T0 缓存
+├─ case_new\                        本轮重跑的物理输入与正式新采样数据
+└─ case\                            历史数据，独立保留，不与 case_new 双向同步
 ```
 
-正式操作顺序和 Windows 任务说明见 [OPERATIONS.md](OPERATIONS.md)。
+- `case_new/CASE_FEATURES.csv` 提供本轮物理参数；`case_new/CASE_MASTER.csv` 与参数表身份集合必须一致。旧 `case` 中的历史数据不得用来替代新一轮验收结果。
+- `settings.py` 中正式输入和 `PUBLISHED` 均直接指向 `case_new`；`icepak_runs/published` 只是现存的兼容 junction，指向同一目录，不另计一套结果。`case/case_XXXX` 仅保留历史，禁止新旧数据互相复制、合并或覆盖。
+- 本次输入与发布路径已在所有在途工作进程自然结束后的安全边界切换至 `case_new`，并通过回归与状态检查。后续严禁热改 `settings.py`。
+- 运行根目录仅在 `settings.py` 定义。生产模块不得写回代码目录；不得重新创建 `icepak_workflow/runs`、`data`、`.repair_stage`、`code_v*`、`candidate` 等目录。
+- 不在本目录保存实验脚本、一次性修复脚本、同步副本、原生仿真工程、输出、日志或历史部署包。
+- 旧源码只能作为离线问题参考，不能被动态导入、复制后运行，不能成为正式模块依赖。不得恢复旧管理器或混合不同轮次标签。
 
-## 模块职责
+## 2. 模块职责
 
-- `main.py`：唯一生产入口；执行 Case 生命周期、排他工作区、发布和 drain/resume。
-- `scheduler.py`：队列锁、动态请求文件、资源准入、worker 监控、超时、孤儿回收和修复等待。
-- `settings.py`、`case_spec.py`：路径、版本标识、运行策略和物理 Case 解析。
-- `geometry.py`、`icepak.py`、`mesh.py`：物理几何、AEDT/Icepak 建模、网格和 CHT。
-- `physical_convergence.py`：从同一 Fluent restart field 继续最多 40 步，测量 Source 温度稳定性并绑定最终原生场。
-- `native_source_temperature_monitor.py/.c`：按实际 Source solid zone 编译只读 Fluent 监控，校验 zone 身份和报告绑定。
-- `native_io.py`、`native_fin_gate.py`：读取原生网格/场，验证 Source、封装、鳍片和接触单元。
-- `sampling.py`：输出 80×80 Gamma、40×40 HTC、128×128/48×48 Source 温度和功率图。
-- `acceptance.py`、`publish.py`：守恒、覆盖率、连续性、发布包完整性和 READY/CHT 收据。
-- `data/`：重型 full-truth 任务及桥接逻辑。
-- `test_reliability.py`、`tests/fixtures/`：不启动 AEDT 的可靠性和输入异常测试。
+| 模块 | 唯一职责 |
+|---|---|
+| `main.py` | 生产命令入口与单 Case 流程编排 |
+| `settings.py` | 路径、资源策略、主机分工配置 |
+| `scheduler.py` | 唯一队列、资源准入、工作进程调度与失败让位 |
+| `native_gate.py` | Windows 原生 Fluent 并发槽位及提交容量保护；异常退出自动释放，不改变物理验收 |
+| `case_spec.py` | 正式参数解析与 Case 物理身份 |
+| `geometry.py` | 同一规则生成几何计划及 Source 分区 |
+| `native_cad.py` | AEDT 原生实体创建、面、顶点与体积读取；不负责调度 |
+| `mesh.py` | 由物理尺寸生成统一网格设置 |
+| `icepak.py` | AEDT/Fluent 会话、边界、求解及原生场获取 |
+| `native_io.py`、`native_fin_gate.py` | 原生文件读取、实体及鳍片/空气证据 |
+| `physical_convergence.py` | 同次原生迭代、Source 温度稳定性验证 |
+| `native_source_temperature_monitor.py/.c` | 原生 Source 温度监测 |
+| `sampling.py` | 双侧 interface 面积积分、守恒栅格化与功率图 |
+| `acceptance.py` | 固定科学验收门槛 |
+| `t0.py` | 四档参考边界求解、身份核查与可信复用 |
+| `publish.py` | 完整结果原子发布及允许范围内的清理 |
+| `temperature40_backfill.py` | 生产发布所需的40×40派生温度；不是一次性实验脚本 |
 
-## 当前提交相对上一版的主要变化
+模块按职责单向调用。不得新建第二管理器、Case 专属入口或相互覆盖的修复分支。回归测试统一放 `icepak_workflow/tests`，不作为生产依赖；一次性实验完成后须清理其脚本和原生工程。
 
-- 新增 `physical_convergence.py`，将原生求解后的继续计算、40 步温度稳定性和最终 Fluent 场身份绑定纳入发布前门禁。
-- 新增 `native_source_temperature_monitor.py/.c`，按真实 Source zone 编译监控，校验绑定哈希、Source 单元数量和体积。
-- 调度器改为动态读取 `REQUESTED_CASES.txt`，增加 `enqueue`、`drain`、`resume`、活动 worker 识别和修复等待。
-- 发布流程增加完整采样包检查、物理输入绑定、代码/网格修订号和 CHT admission 收据。
-- 新增可靠性测试；运行数据、AEDT 工程、Fluent 网格/场、日志和缓存继续排除在仓库之外。
+## 3. 修改与部署
 
-## 依赖与运行边界
+修改前确认实际管理器命令、工作进程、PID、出生时间、代码位置及其他编辑会话。禁止修改在途任务可能导入的源文件。只允许暂停新任务准入，等待当前 Case 自然完成，再在安全边界部署共用修改；不得为部署强杀有效原生求解。
 
-这是 Windows/Ansys 专用生产代码，不是纯 Python CFD 求解器。运行至少需要：
+先做小范围回归与真实流程验证，再恢复唯一生产任务。记录是否影响物理条件、网格、采样或验收。不得通过状态改写把失败改为通过。不得根据 Case ID、温度、神经网络误差或失败次数切换物理模型。
 
-- Ansys AEDT/Icepak 2023.2、Fluent 和 PyAEDT；
-- Python 包 `psutil`、`numpy`、`scipy`；
-- 项目级 `case/CASE_FEATURES.csv`、Case 原生工程、网格和 Fluent 字段；
-- 与当前部署一致的 `CASE_MASTER.csv` 和历史队列状态收据。
+维护执行约束：不为日常推进引入全量哈希、重复状态清单或新的管理器；优先用 Case ID、物理输入、代码/配置版本和正式验收凭据核对身份。一次性测试脚本、调试插桩及临时产物应在验证结束后清理，可重复的长期回归测试留在现有 `tests/`。不在授权目录外创建临时文件夹或代码副本，不为整理而重置既有未提交修改。每次汇报区分“代码已修改、测试通过、已部署、真实验收、持续新增发布”，不能混报。
 
-当前代码中的 `settings.py` 将 `CASE_MASTER` 指向 `case/CASE_MASTER.csv`，而项目长期规则把根目录 `CASE_MASTER.csv` 作为权威接口；部署前必须核对两者身份，不能默认它们一致。full-truth 入口还保留若干本机 `D:/E:/F:` 外部资料路径，需要按实际机器配置。
+目录迁移只改变路径，不改变几何、材料、功率、网格规则、收敛标准、采样定义或 T0 身份。历史收据中的原生路径作为当时的来源证据原样保留，通过数据迁移位置记录解释其现位置，不重写科学证据。
 
-## 验证状态
+## 4. 不可改变的物理合同
 
-- `python -m compileall`：通过。
-- `python -B test_reliability.py`：当前环境因缺少 `psutil` 未执行完成。
-- `python -B main.py status`：同样因缺少 `psutil` 阻塞。
-- 未在本次同步中启动真实 CHT，也未上传 `runs/` 运行数据。
+固定合同包括：几何尺寸与坐标、Source 数量/层别/位置/尺寸/功率、材料与厚度、散热器底座/鳍片/空气通道、TIM2/IHS/FEOL/HB 接触、风速/入口/出口/流向、包底/侧壁/环境边界、单位与真实面积。
 
-未在原项目中指定许可证。
+必须确认 Source 总功率与分层功率、实际热源位置；鳍片完整入原生网格、与底座接触有效、与空气有真实换热面；封装到散热器热路径完整；非共形接触按真实重叠面积连接；原生实体、材料和接触符合冻结输入。
+
+不得通过删减或缩小热源、删除鳍片/通道、替换材料或边界、关闭接触、使用默认物理值、套用其他尺寸网格来提高通过率。
+
+## 5. 收敛与证据
+
+| 必要条件 | 统一门槛 |
+|---|---:|
+| 全域质量相对不平衡 | ≤0.1% |
+| 封装能量相对误差 | ≤0.5% |
+| Source 温度稳定窗口 | 至少连续40次真实迭代 |
+| 窗口内温度范围 | ≤0.6 K（温差） |
+| 总迭代次数 | 不设上限，持续按40次迭代窗口核验直到达标 |
+| 原生依据 | 与本 Case 本轮最终采样场一致，可追溯 |
+
+质量和能量必须来自原生通量/热流积分，不用几何理论值代替；温度稳定性来自同次真实迭代序列，不能由最终温度推断。连续性、速度和能量残差须记录，仅作诊断，不代替上述条件。
+
+证据缺失只能记为待核实或失败，不得发布。输入、几何、网格、迭代历史、温度序列、通量和最终采样必须属于同一轮求解，禁止拼接不同轮次证据。旧版 Case 0107 不是自动正确的真值；不能因为新版残差更小就覆盖旧标签。
+
+## 6. Interface 与输出合同
+
+正式标签来自双侧原生物理 interface 面积积分；禁止单侧 wall、点采样、单纯几何表面、未经守恒核验的插值及 wall/interface 混合。
+
+| 输出 | 分辨率 |
+|---|---:|
+| Gamma 温度、热流、HTC | 80×80 |
+| 训练 HTC | 40×40 |
+| Bottom/Top Source 温度 | 各128×128 |
+| Bottom/Top 功率图 | 正式合同规定的各网格 |
+| T0 | h0=250、500、1000、2000 四档 |
+| Bottom/Top Source 派生温度 | 各40×40，面积守恒降采样 |
+
+检查双侧接触身份、原生面积一致、投影覆盖、上下层覆盖率、有限值、单位、Gamma热流与原生积分、功率图与实际功率。积分为 `Q=sum(q_ij*A_ij)`，使用真实面积，不以像素数代替面积。
+
+40×40 Source 温度由可信128×128 interface温度按面积重叠加权生成，保持面积平均温度，不重新仿真，不冒充独立原生40×40采样。128×128原始标签继续保留。
+
+## 7. T0
+
+复用需 package 几何、Source 分布/功率、材料、边界、h0、采样定义与完整可信收据一致。先查实际缺项，只补缺失或证实失效档位。不得为补 T0 重跑已合格CHT，也不得重复计算已有可信T0。必须区分CHT完成与完整CHT+T0完成，不得将二者混报。
+
+## 8. 队列、资源与进程
+
+同一 Case 同时只能有一个正式工作进程，主机间预留清单必须排他。真实并行按实际计算的 Case 统计；等待、空闲Python、只持有锁及失效状态不计入有效并行。
+
+本机按实际CPU、物理内存、提交容量、磁盘和许可证确定并行。服务器约20例目标不直接套用到本机。判断优化是否有效，看每小时新增合格Case、资源争用、许可证失败、孤儿进程和验收失败率。
+
+单 Case 失败后释放其占用并继续后续任务；失败分类记录，有限重试，同类问题修复共用逻辑。正常/未失败 Case 优先派发，同时至少保留一条失败恢复通道；即使指定 `--ids`，也不得让旧失败 Case 占满全部并行槽。原生 Fluent 同时求解限制为本机 2 槽，不占用更多物理内存，不以等待进程数充当有效并行。清理受阻不能永久占用计算槽，不重复派发运行中、已发布或仍在清理的Case。新增清单只在安全同步点刷新。
+
+回收须同时核对PID、出生时间、工作目录、父子关系和阶段，覆盖AEDT/Icepak/Fluent/MPI等所属进程。不得按进程名或PID盲杀，不重启机器，不停止有效原生计算。
+
+## 9. 发布与清理
+
+只有完整物理验收、同次双侧interface、所有守恒检查、四档可信T0、完整可读文件和收据都满足，才能原子发布。单个PASS/READY/PUBLISHED标记或目录存在不能单独证明完成。
+
+发布后且消费者已退出，可以清理可再生CAD、网格、原生场及临时工程。必须保存Gamma、HTC、Source温度/功率、四档T0、物理参数、简洁验收凭据和必要失败根因证据。禁止删除在途文件、尚未发布的唯一原生证据、仍在读取的T0或未绑定数据。
+
+禁止在源码目录重新积累一次性实验、下载/同步副本或历史代码。可重复回归测试统一留在本目录 `tests/`，原生测试工程留在运行临时空间，验证结束后清除。
+
+## 10. 验收与状态汇报
+
+恢复生产前验证：单例成功、几何/网格/接触/鳍片、物理收敛、双侧interface、面积/热流/功率守恒、T0复用/补缺、失败让位、资源回收及连续合格产出。
+
+状态汇报包含实际运行Case及阶段、新增CHT与完整CHT+T0数量、近一小时新增数量、失败类型、CPU/内存/磁盘/许可证、孤儿/重复管理器、清理阻塞及待核实结果。不得以目录更新时间、进程数或Running标记冒充有效产出。
+
+最终标准：合法输入无需Case专属脚本、无新旧混用；Source 温度稳定门槛依已确认要求为 0.6 K，其余物理门槛不变，即可持续完成建模→网格→原生CHT→物理验收→双侧interface面积采样→T0复用/补缺→完整发布→安全清理→下一Case。
+
+## 11. 常用命令
+
+```text
+python -B main.py status
+python -B main.py plan case_5114
+python -B -m unittest discover -s tests -p "test_*.py"
+```
+
+本机正式调度任务为 `NeuralCHT_IcepakWorkflow_Local`，运行唯一 `main.py queue` 管理器；实际输入与正式输出已指向 `case_new`。旧 `case` 不迁入新目录，也不接收本轮重跑结果。
+

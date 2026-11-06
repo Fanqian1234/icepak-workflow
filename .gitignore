@@ -1,20 +1,5 @@
-# 运行产物 — 2.8 GB 工作区、采样数据、已发布结果
-runs/
-
-# 手动 diff 机制 — 由 git 本身替代，已废弃
-.repair_stage/
-
-# 运行日志（无限增长，不代表代码状态）
-batch.log
-*.log
-
-# Python 字节码与缓存
 __pycache__/
 *.py[cod]
+*.log
+*.tmp
 
-# 空占位目录
-assets/
-
-# Windows 系统文件
-Thumbs.db
-desktop.ini

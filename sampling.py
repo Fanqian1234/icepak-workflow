@@ -163,24 +163,42 @@ def _scalar_faces(native):
 def _gamma_faces(native,plan,scalar):
     tim2={zid for zid,z in native.zones.items()
           if z["name"].lower()=="tim2_solid"}
-    if not tim2:
-        raise RuntimeError("Native TIM2 material zone not found")
+    base={zid for zid,z in native.zones.items()
+          if z["name"].lower()=="heatsink_base_solid"}
+    if not tim2 or not base:
+        raise RuntimeError("Native TIM2/heatsink material zones not found")
     ztop=plan.gamma_bbox_mm[2]*1e-3
-    parents=[]
+    parent_groups=defaultdict(list)
     for f in native.faces:
         zid=f[1];z=native.zones[zid]
         if z["type"] not in ("interface","wall") or len(f[2])<3:
             continue
         a,b=int(native.cells[f[3]]),int(native.cells[f[4]])
-        if a not in tim2 and b not in tim2:
+        if a not in tim2|base and b not in tim2|base:
             continue
         p=native.nodes[f[2]]
         if np.ptp(p[:,2])>1e-10 or abs(float(p[:,2].mean())-ztop)>1e-8:
             continue
         if _projection(native.nodes,f)>1e-20:
-            parents.append(f)
-    if not parents:
-        raise RuntimeError("Native TIM2 top interface missing")
+            parent_groups[zid].append(f)
+    # An NCI may expose an oversized TIM2 parent and a matching parent
+    # on the other side. Map TIM2-side child heat through the real contact
+    # footprint; never distribute it across the heatsink overhang.
+    x0,y0,_,x1,y1,_=plan.gamma_bbox_mm
+    expected=(x1-x0)*(y1-y0)*1e-6
+    bounds=np.array([x0,y0,x1,y1])*1e-3
+    candidates=[]
+    for zid,group in parent_groups.items():
+        area=sum(_projection(native.nodes,f) for f in group)
+        if not np.isclose(area,expected,rtol=5e-3,atol=1e-12):
+            continue
+        vertices=np.vstack([native.nodes[f[2]][:,:2] for f in group])
+        extent=np.r_[vertices.min(axis=0),vertices.max(axis=0)]
+        if np.allclose(extent,bounds,rtol=0,atol=1e-8):
+            candidates.append((abs(area-expected),-len(group),zid,group))
+    if not candidates:
+        raise RuntimeError("Native Gamma parent footprint differs from the frozen TIM2/base contact")
+    parents=min(candidates,key=lambda item:item[:3])[3]
     parent_ids={f[0] for f in parents}
     by_face_id={f[0]:f for f in native.faces}
     children=defaultdict(list)
@@ -188,9 +206,19 @@ def _gamma_faces(native,plan,scalar):
         for pid in pids:
             if pid in parent_ids:
                 children[pid].append(child)
+    # A Fluent NCI can expose both its interface parent and physical
+    # child-wall records. Never integrate the same physical face twice.
+    covered_children={
+        child for child,pids in native.parents_of.items()
+        if child in parent_ids
+        and any(pid in parent_ids
+                and native.zones[by_face_id[pid][1]]["type"]=="interface"
+                for pid in pids)}
     polys=[]; Q=[]; T=[]; A=[]
     for f in parents:
         pid,zid=f[0],f[1]
+        if pid in covered_children:
+            continue
         area=_projection(native.nodes,f)
         values=scalar.get(pid,{})
         # The established native Gamma rule ALWAYS aggregates actual NCI
@@ -303,7 +331,19 @@ def _raster_gamma(polys,Q,T,A,bbox,n):
     if (area_err>0.01 or heat_err>5e-3
             or not (np.isfinite(temp).all() and np.isfinite(flux).all()
                     and np.isfinite(h).all())):
-        raise ValueError("Gamma area/energy projection not conservative")
+        # Native field evidence is deleted after a failed Case. Report
+        # only the already-computed polygon coverage, without weakening
+        # any conservation gate or creating per-case diagnostic files.
+        covered=np.asarray(M.sum(axis=1)).ravel()
+        outside=np.maximum(A-covered,0)
+        partial=int(np.count_nonzero(outside>np.maximum(A*1e-5,1e-16)))
+        raise ValueError(
+            "Gamma area/energy projection not conservative: "
+            f"area_error={area_err:.6g} heat_error={heat_err:.6g} "
+            f"native_heat_W={float(Q.sum()):.6g} "
+            f"raster_heat_W={float(q_heat.sum()):.6g} "
+            f"partially_unprojected_faces={partial} "
+            f"unprojected_native_area_mm2={float(outside.sum()*1e6):.6g}")
     proof={"area_relative_error":area_err,"heat_relative_error":heat_err,
            "native_heat_W":float(Q.sum()),"pixel_heat_W":float(q_heat.sum())}
     return edges,temp-273.15,flux,h,proof
@@ -630,7 +670,7 @@ def _source_interface(native,plan,layer,scalar,n=128):
         area=_projection(native.nodes,f)
         if area<=1e-20:
             continue
-        row=(pts[:,:2].copy(),float(value),area)
+        row=(pts[:,:2].copy(),float(value),area,int(f[0]),zone_type)
         if any(("active_"+layer+"_source" in name or
                 "passive_feol" in name) for name in names):
             sides["source"].append(row)
@@ -638,6 +678,21 @@ def _source_interface(native,plan,layer,scalar,n=128):
         if upper in names:
             sides["upper"].append(row)
             encodings["upper"][zone_type]+=1
+
+    # Prefer native child faces when the same interface parent and its
+    # child walls are both exported. This preserves physical two-sided
+    # area integration without overcounting either Source contact side.
+    for side,records in sides.items():
+        face_ids={row[3] for row in records}
+        shadowed={
+            pid for row in records
+            for pid in native.parents_of.get(row[3],())
+            if pid in face_ids}
+        if shadowed:
+            sides[side]=[row for row in records if row[3] not in shadowed]
+        encodings[side]=defaultdict(int)
+        for row in sides[side]:
+            encodings[side][row[4]]+=1
 
     def project(side):
         rows=sides[side]
@@ -837,3 +892,4 @@ def sample_native_case(spec,plan,workspace,output,*,fin_gate=None,
                         for layer in ("bot","top")}},
                    indent=2)+"\n",encoding="utf-8")
     return proof
+

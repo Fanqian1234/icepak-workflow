@@ -223,7 +223,11 @@ def verify_native_fins(mesh_path, plan):
                  and abs(overlap) <= 1e-7
                  and not row['odd_intersection_cells'])
         if not valid:
-            failures.append((name, 'native solid/fluid occupancy mismatch'))
+            failures.append((
+                name,'native solid/fluid occupancy mismatch: '
+                f'span_mm={span:.6g} solid_mm={solid:.6g} '
+                f'fluid_mm={fluid:.6g} overlap_mm={overlap:.6g} '
+                f'odd_cells={row["odd_intersection_cells"]}'))
     if failures:
         raise ValueError(
             'NATIVE_FIN_MATERIAL_OCCUPANCY_FAILED: '
@@ -239,3 +243,4 @@ def verify_native_fins(mesh_path, plan):
         'read_only': True,
         'finite_rays_not_global_CHT_acceptance': True,
     }
+

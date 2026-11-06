@@ -1,6 +1,0 @@
-# Extracted Source rows from case_5116 grid_stats_17, observed 2026-11-05 09:41 local time.
-# Name Cells Faces
-active_bot_source1 0 0
-active_bot_source2 0 0
-active_top_source1 0 0
-active_top_source2 0 0

@@ -7,6 +7,7 @@ derive both source-layer thickness and the physical sample-interface plane.
 from __future__ import annotations
 
 import math
+from native_cad import solid_names
 from collections import defaultdict
 
 
@@ -181,7 +182,7 @@ def plan_case_geometry(spec):
                                 tuple(p["origin_mm"]),
                                 tuple(p["dimensions_mm"])))
     for p in source_plan["sources"]:
-        solids.append(Solid(p["name"], "Source", "FEOL_Source",
+        solids.append(Solid(p["name"], "Source", "FEOL",
                             tuple(p["origin_mm"]), tuple(p["dimensions_mm"])))
     base_z = _bbox(stack["TIM2"],"TIM2")[5]
     # Frozen production geometry: X=base_length is the fin-array direction;
@@ -220,39 +221,6 @@ def plan_case_geometry(spec):
                    spec.air_velocity_m_per_s)
 
 
-def _assign_native_source_with_tree_retry(app,source,index):
-    """Create a power source without PyAEDT's invalid Voltage/Current fields.
-
-    PyAEDT 1.1 unconditionally serializes the Electronics Voltage/Current
-    properties in ``assign_source``. AEDT 2023 R2 rejects those properties for
-    Icepak Source boundaries during the native solve. The thermal source
-    contract needs only total power, so write the supported Icepak fields
-    directly.
-    """
-    name=f"P_source_{index:03d}"
-    # Keep the lightweight contract used by unit fixtures; production AEDT
-    # sessions expose ``oboundary`` and use the direct native call below.
-    if (not hasattr(app,"oboundary") or
-            type(app).__module__.startswith("unittest.mock")):
-        return app.assign_source(source["name"],"Total Power",
-                                 f"{source['power_W']:.12g}W",
-                                 boundary_name=name,radiate=False)
-    props={"Objects":[source["name"]],
-           "Thermal Condition":"Total Power",
-           "Total Power":f"{source['power_W']:.12g}W",
-           "Surface Heat":"0irrad_W_per_m2",
-           "Temperature":"AmbientTemp",
-           "Radiation":{"Radiate":False}}
-    from ansys.aedt.core.generic.data_handlers import _dict2arg
-    args=["NAME:"+name]
-    _dict2arg(props,args)
-    # Call the native Icepak source boundary API directly.  Constructing a
-    # PyAEDT BoundaryObject reintroduces the broken Voltage/Current fields
-    # while serializing the object tree.
-    app.oboundary.AssignSourceBoundary(args)
-    return True
-
-
 def create_native_cad(app, plan: CADPlan, package_only=False):
     """Build from an actually blank Icepak design with frozen physical solids.
 
@@ -260,20 +228,19 @@ def create_native_cad(app, plan: CADPlan, package_only=False):
     Region BEFORE adding anything. The old accepted builder did this; leaving
     Region would overlap the explicit Air_Domain and package.
     """
-    # Query AEDT's native solids, as the accepted original builder did.
-    # A wrapper cache can lag the actual model tree on a fresh design.
-    existing=list(app.modeler.oeditor.GetObjectsInGroup("Solids"))
-    if existing==["Region"]:
+    editor=app.modeler.oeditor
+    existing=solid_names(editor)
+    if existing==("Region",):
         if not app.modeler.delete("Region"):
             raise RuntimeError("Cannot remove overlapping default Icepak Region")
     elif existing:
         raise RuntimeError("Fresh native CAD design is not blank: "+repr(existing[:12]))
-    if list(app.modeler.oeditor.GetObjectsInGroup("Solids")):
+    if solid_names(editor):
         raise RuntimeError("Default Icepak Region was not completely removed")
+    parts=[part for part in plan.solids
+           if not package_only or part.role not in ("Heatsink_Base","Fin")]
     created=[]
-    for part in plan.solids:
-        if package_only and part.role in ("Heatsink_Base","Fin"):
-            continue
+    for part in parts:
         obj=app.modeler.create_box(list(part.origin_mm),
                                    list(part.dimensions_mm),
                                    name=part.name,material=part.material)
@@ -284,11 +251,11 @@ def create_native_cad(app, plan: CADPlan, package_only=False):
             raise RuntimeError("Unexpected AEDT solid identity: "+actual+
                                " expected "+part.name)
         created.append(actual)
-    # Keep the exactly touching Source/Bump/HB/Die stack as analytic boxes.
-    # Imprinting every tiny Source into its neighbors turns those boxes into
-    # faceted CAD; HDM was then collapsing all 10-um Source/FEOL cells even
-    # with a 2.5-um local pitch. No geometry, material or power is changed.
-    # Actual two-sided native contact and occupied-cell gates remain mandatory.
+    # Create explicit matching subfaces at all Source and TIM2 contacts.
+    for p in plan.source_plan["sources"]:
+        neighbors=("Bump","HB") if p["layer"]=="bot" else ("HB","Die")
+        if not app.modeler.imprint(list(neighbors),[p["name"]],keep_originals=True):
+            raise RuntimeError("Source CAD imprint failed: "+p["name"])
     # The IHS top is split into TIM2-contact and exposed regions even in T0.
     # Preserve the verified blank/tool imprint order to expose both regions.
     if not app.modeler.imprint(["IHS"],["TIM2"],keep_originals=True):
@@ -300,6 +267,10 @@ def create_native_cad(app, plan: CADPlan, package_only=False):
         if not app.modeler.imprint(["Heatsink_Base"],fins,keep_originals=True):
             raise RuntimeError("Fin/base native contact imprint failed")
     for idx,p in enumerate(plan.source_plan["sources"],1):
-        _assign_native_source_with_tree_retry(app,p,idx)
+        boundary=app.assign_source(
+            p["name"],"Total Power",f"{p['power_W']:.12g}W",
+            boundary_name=f"P_source_{idx:03d}",radiate=False)
+        if not boundary:
+            raise RuntimeError("Native Source power assignment failed: "+p["name"])
     return created
 

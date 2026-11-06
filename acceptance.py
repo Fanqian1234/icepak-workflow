@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 
 from geometry import CADPlan
+from settings import SOURCE_TEMPERATURE_STABILITY_K
 
 
 def preflight_case(spec, plan: CADPlan):
@@ -49,12 +50,12 @@ def accept_sample(spec, proof: dict):
         raise ValueError("Native fin and channel volume cells were not verified")
     if proof.get("native_solid_cells",{}).get("status")!="PASS_NATIVE_SOLID_CELLS":
         raise ValueError("Native package, Source and FEOL volume cells were not verified")
-    # The historic successful-110 physical convergence contract is mandatory.
-    # Residuals are diagnostic; neither a normal Icepak exit nor a 450-step
-    # cutoff establishes conservation or temperature stability.
+    # Measured native Source temperature convergence is mandatory.
+    # Residuals are diagnostic; neither a normal Icepak exit nor an
+    # iteration count establishes conservation or temperature stability.
     convergence=proof.get("native_convergence") or {}
     if (convergence.get("status")!="MEASURED" or
-            not 0<int(convergence.get("iterations") or 0)<=450):
+            int(convergence.get("iterations") or 0)<=0):
         raise ValueError("Measured native iteration evidence is missing")
     mass=proof.get("mass_balance") or {}
     if (mass.get("status")!="MEASURED" or
@@ -65,7 +66,7 @@ def accept_sample(spec, proof: dict):
     if (stability.get("status")!="MEASURED" or
             int(stability.get("sampled_window_iterations") or 0)<40 or
             not math.isfinite(float(stability.get("max_temperature_range_K",float("inf")))) or
-            float(stability["max_temperature_range_K"])>0.5):
+            float(stability["max_temperature_range_K"])>SOURCE_TEMPERATURE_STABILITY_K):
         raise ValueError("Native Source temperature has not stabilized for 40 iterations")
     energy=proof.get("package_energy",{})
     if (energy.get("status")!="PASS" or
@@ -112,3 +113,4 @@ def accept_sample(spec, proof: dict):
         raise ValueError("Source raster power does not close")
     return {"status":"PASS","case_id":spec.case_id,
             "source_total_power_W":total}
+

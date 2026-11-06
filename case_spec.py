@@ -226,3 +226,4 @@ def case_by_id(case_id: str, path: Path = CASE_FEATURES) -> CaseSpec:
     if case_id in errors:
         raise ValueError(case_id + ": " + errors[case_id])
     return cases[case_id]
+

@@ -1,7 +1,6 @@
 """Configure a read-only native cell-temperature monitor, without a case whitelist."""
 import hashlib
 import json
-import math
 import mmap
 import os
 from pathlib import Path
@@ -29,24 +28,18 @@ def prepare(mesh, work, monitored_names):
     ids = {}
     for layer in ('bottom', 'top'):
         selected = monitored_names[layer]
-        if any(len(names.get(name, [])) != 1 for name in selected):
+        if not selected or any(len(names.get(name, [])) != 1 for name in selected):
             raise ValueError('Native source-temperature zone selection is missing or ambiguous')
         ids[layer] = [names[name][0] for name in selected]
-    if not ids['bottom'] and not ids['top']:
-        raise ValueError('No native Source monitor zones')
     if set(ids['bottom']) & set(ids['top']):
         raise ValueError('Bottom and top monitor zones overlap')
     source = SOURCE.read_bytes()
     binding = hashlib.sha256(source + json.dumps(ids, sort_keys=True).encode('ascii')).hexdigest()
-    declarations=[]
-    for layer in ('bottom','top'):
-        n=len(ids[layer])
-        names=','.join(map(str,ids[layer])) or '0'
-        declarations.extend([
-            '#define NCI_'+layer.upper()+'_COUNT '+str(n),
-            'static const int nci_'+layer+'_ids['+str(max(n,1))+'] = {'+names+'};'])
-    header='\n'.join(['#define NCI_SOURCE_BINDING "'+binding+'"',
-                      *declarations,''])
+    header = '\n'.join([
+        '#define NCI_SOURCE_BINDING "' + binding + '"',
+        *['#define NCI_' + layer.upper() + '_COUNT ' + str(len(ids[layer])) + '\n'
+          + 'static const int nci_' + layer + '_ids[] = {' + ','.join(map(str, ids[layer])) + '};'
+          for layer in ('bottom', 'top')], ''])
     directory = Path(work) / 'tmp'; directory.mkdir(exist_ok=True)
     (directory / SOURCE.name).write_bytes(source)
     (directory / 'nci_source_temperature_ids.h').write_text(header, encoding='ascii')
@@ -97,18 +90,8 @@ def validate_reports(log, prepared):
     if not bindings or len(bindings)!=blocks or any(value!=prepared['binding'] for value in bindings):
         raise ValueError('Native temperature report identity is incomplete or different')
     cells=re.findall(r'^NCI_SOURCE_MONITOR_CELLS bottom=(\d+) top=(\d+) volume_bottom=([\d.eE+-]+) volume_top=([\d.eE+-]+)$',log,re.M)
-    if len(cells)!=blocks:
-        raise ValueError('Missing native Source cell-report blocks')
-    for row in cells:
-        for i,layer in enumerate(('bottom','top')):
-            count=int(row[i]);volume=float(row[i+2])
-            if not math.isfinite(volume):
-                raise ValueError('Nonfinite Source cell volume')
-            if prepared['zone_ids'][layer]:
-                if count<=0 or volume<=0:
-                    raise ValueError('Required Source-layer cells missing')
-            elif count!=0 or volume!=0:
-                raise ValueError('Unexpected cells in physically absent Source layer')
+    if len(cells)!=blocks or any(not all(float(v)>0 for v in row) for row in cells):
+        raise ValueError('Native temperature report has missing cells or volume')
     return blocks
 
 
@@ -162,3 +145,4 @@ def report_evidence(work, log):
         raise ValueError('Missing native source-temperature execution evidence')
     return dict(method='RESIDENT_CELL_REDUCTION_V1',source_sha256=source_hash,
         native_report_bindings=bindings,files_sha256=files)
+
